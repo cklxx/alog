@@ -29,12 +29,14 @@ median of 3 warm runs.
 | index size | **763 MB = 13.6%** of source |
 | single-term search | **2 ms** over 1,181,013 documents |
 | phrase search | **2 ms** |
-| 50 newest failed tool calls | **17 ms** |
+| 50 newest failed tool calls | **116 ms**, or **17 ms** after `alog index err` |
 | session timeline, 400 rows + previews | **28 ms** |
 | catalog for an agent | **1,669 bytes** |
 | binary | **2.6 MB**, no runtime |
 
-Reproduce with `alog sync <dir> && alog stats`.
+Reproduce with `alog sync <dir> && alog stats`. The index size is what `sync` writes; the
+optional secondary indexes (`alog index err ts target`) add 134.5 MB on top, 17.6% more.
+Search needs no index — fts5 is built during `sync`.
 
 ## Why not a directory of jsonl files
 
@@ -44,7 +46,7 @@ They work until you have 500. Then:
 |---|---|---|
 | every session that touched `auth.py` | scan 5.6 GB | 165 ms scan of the index |
 | what did this command print last time | `rg` across 10k files | 2 ms full-text |
-| what broke, and in which tool | grep and hope | `alog errors`, 17 ms |
+| what broke, and in which tool | grep and hope | `alog errors`, 116 ms |
 | hand one session to a colleague | copy a 300 MB file | `alog dump <session>` |
 | what's even in here | `ls`, then guess | 1,669-byte catalog |
 
@@ -151,7 +153,9 @@ content under `payload`, so it needs its own extractor.
 - Linux measurement. Every number here is macOS/APFS; `fsync` semantics differ on Linux, so
   the durability section is Darwin-only until measured.
 - fts5 exact-duplicate collapse: index identical text once, keep every `(session, seq)` hit,
-  so coverage is unchanged.
+  so coverage is unchanged. fts5 tokenize+index is the single largest cost in `sync` —
+  measured by ablation at 41% of ingest wall time in the Python prototype, not yet re-measured
+  in Rust.
 
 **v0.3.**
 - A small state table agents coordinate through: claim, lease, fence, audit. Separate file at
