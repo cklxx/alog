@@ -29,7 +29,12 @@ input[type=search]:focus { outline: none; border-color: var(--acc); }
   padding: 4px 9px; border-radius: 5px; }
 .tabs button.on { background: var(--ink); color: var(--panel); }
 #wrap { display: grid; grid-template-columns: 300px 1fr; height: calc(100vh - 41px); }
-#list { border-right: 1px solid var(--line); overflow-y: auto; background: var(--panel); }
+#side { border-right: 1px solid var(--line); background: var(--panel); overflow: hidden;
+  display: grid; grid-template-rows: auto 1fr; }
+#filter { width: 100%; padding: 5px 9px; border: 0; border-bottom: 1px solid var(--line);
+  background: var(--panel); color: var(--ink); font: 11.5px var(--mono); }
+#filter:focus { outline: none; background: var(--bg); }
+#list { overflow-y: auto; }
 #main { overflow-y: auto; padding: 0 0 40px; }
 .sess { padding: 7px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
 .sess:hover { background: var(--bg); }
@@ -60,6 +65,9 @@ tr.err td.k { color: var(--err); font-weight: 500; }
 .snip { font-family: var(--mono); font-size: 11px; color: var(--dim); white-space: pre-wrap;
   word-break: break-all; max-height: 3.2em; overflow: hidden; }
 .snip mark { background: var(--hl); color: inherit; }
+.more { display: block; width: 100%; border: 0; border-top: 1px solid var(--line);
+  background: var(--panel); color: var(--dim); font: inherit; padding: 8px; cursor: pointer; }
+.more:hover { color: var(--ink); background: var(--bg); }
 #rec { position: fixed; right: 0; top: 41px; bottom: 0; width: min(620px, 52vw);
   background: var(--panel); border-left: 1px solid var(--line); overflow: auto;
   padding: 10px 14px; box-shadow: -8px 0 24px rgba(0,0,0,.07); }
@@ -97,7 +105,10 @@ tr.err td.k { color: var(--err); font-weight: 500; }
 </div>
 
 <div id="wrap">
-  <div id="list"></div>
+  <div id="side">
+    <input id="filter" placeholder="filter sessions…">
+    <div id="list"></div>
+  </div>
   <div id="main"><div class="empty">pick a session</div></div>
 </div>
 
@@ -126,38 +137,53 @@ async function boot() {
   $('#hdr').textContent =
     `${num(st.events)} events · ${st.sessions} sessions · ${mb(st.bytes)}` +
     (st.rejects ? ` · ${st.rejects} unparsed` : '');
-  $('#list').innerHTML = ss.map((s, i) => `
-    <div class="sess" data-i="${i}" data-sid="${s.sid}">
+  $('#filter').oninput = e => sidebar(e.target.value);
+  $('#list').onclick = e => {
+    const d = e.target.closest('.sess');
+    if (!d) return;
+    document.querySelectorAll('.sess').forEach(x => x.classList.toggle('on', x === d));
+    S.sid = +d.dataset.sid;
+    tab('timeline');
+  };
+  sidebar('');
+  if (ss.length) S.sid = ss[0].sid;
+  render();
+}
+
+function sidebar(needle) {
+  const q = needle.trim().toLowerCase();
+  const hits = q ? S.sessions.filter(s => s.ext.toLowerCase().includes(q)) : S.sessions;
+  $('#list').innerHTML = hits.map(s => `
+    <div class="sess${s.sid === S.sid ? ' on' : ''}" data-sid="${s.sid}">
       <div class="n" title="${esc(s.ext)}">${esc(s.ext)}</div>
       <div class="m">
         <span>${day(s.t1)}</span><span>${num(s.n)} ev</span>
         ${s.tok ? `<span>${num(s.tok)} tok</span>` : ''}
         ${s.err ? `<span class="e">${s.err} err</span>` : ''}
       </div>
-    </div>`).join('');
-  $('#list').onclick = e => {
-    const d = e.target.closest('.sess');
-    if (!d) return;
-    document.querySelectorAll('.sess').forEach(x => x.classList.toggle('on', x === d));
-    S.sid = +d.dataset.sid;
-    S.view = 'timeline';
-    document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x.dataset.v === 'timeline'));
-    render();
-  };
-  if (ss.length) { $('.sess').classList.add('on'); S.sid = ss[0].sid; }
+    </div>`).join('') || '<div class="empty">no match</div>';
+}
+
+function tab(v) {
+  S.view = v;
+  document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x.dataset.v === v));
   render();
 }
 
 function render() {
   if (S.view === 'stats') return stats();
   if (S.view === 'errors') return errors();
-  if (S.sid != null) timeline(S.sid);
+  if (S.sid != null) timeline(S.sid, 0);
 }
 
-async function timeline(sid) {
-  const d = await api('/timeline', {sid, limit: 500});
+const PAGE = 400;
+
+async function timeline(sid, start) {
+  const d = await api('/timeline', {sid, start, limit: PAGE});
+  // Day separators are inserted client-side: the boundary depends on the
+  // reader's timezone, which the server does not know.
   const out = [];
-  let lastDay = '';
+  let lastDay = start ? S.lastDay : '';
   for (const r of d.rows) {
     const dy = day(r.ts);
     if (dy && dy !== lastDay) {
@@ -171,11 +197,36 @@ async function timeline(sid) {
       <td class="t">${clock(r.ts)}</td>
       <td class="k">${esc(r.err ? 'ERROR' : r.role || r.kind)}</td>
       <td class="tool">${esc(r.tool || '')}</td>
-      <td class="tg" title="${esc(r.target)}">${esc(r.target || '')}</td>
+      <td><div class="snip">${esc(r.target || r.text)}</div></td>
       <td class="num">${tok}</td>
       <td class="num">${r.len > 2048 ? num(r.len) + 'B' : ''}</td>
     </tr>`);
   }
+  S.lastDay = lastDay;
+  S.seen = (start ? S.seen : 0) + d.rows.length;
+
+  const next = d.rows.length ? d.rows[d.rows.length - 1].seq + 1 : 0;
+  const foot = d.rows.length === PAGE
+    ? `<button class="more" data-next="${next}">${num(d.n_shown - S.seen)} more</button>`
+    : d.hidden ? `<div class="empty">${num(d.hidden)} framework events hidden</div>` : '';
+
+  if (start) {
+    $('#main .more')?.remove();
+    $('#main tbody').insertAdjacentHTML('beforeend', out.join(''));
+    $('#main').insertAdjacentHTML('beforeend', foot);
+  } else {
+    $('#main').innerHTML = `<table>
+      <thead><tr><th>#</th><th>time</th><th>who</th><th>tool</th><th>what</th>
+      <th>tok in/out</th><th>size</th></tr></thead>
+      <tbody>${out.join('')}</tbody></table>${foot}`;
+  }
+  $('#main').onclick = e => {
+    const m = e.target.closest('.more');
+    if (m) return timeline(sid, +m.dataset.next);
+    const tr = e.target.closest('tr.ev');
+    if (tr) show(sid, +tr.dataset.seq);
+  };
+}
   const foot = [];
   if (d.rows.length < d.n_shown) foot.push(`showing ${d.rows.length} of ${num(d.n_shown)}`);
   if (d.hidden) foot.push(`${num(d.hidden)} framework events hidden`);

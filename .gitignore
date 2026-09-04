@@ -1,8 +1,4 @@
-__pycache__/
-*.pyc
+target/
 *.db
 *.db-wal
 *.db-shm
-dist/
-*.egg-info/
-target/
