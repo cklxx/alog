@@ -17,7 +17,7 @@ USAGE
   alog search <query>           full-text search; fts5 syntax
   alog show <session> [seq]     one session's timeline, or one record
   alog sql <query>              read-only SQL over the index
-  alog catalog                  what is in the store, in ~340 tokens
+  alog catalog                  what is in the store, schema and distributions
   alog errors                   failed tool calls, newest first
   alog dump [<session>]         byte-identical jsonl to stdout
   alog index <col>              build a secondary index: kind tool target ts err
@@ -122,17 +122,30 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err("sync needs a directory".into());
             }
             for d in &o.rest {
-                let (files, records, el) = sync(&o.db, Path::new(d), o.threads)?;
+                let (files, records, bare, el) = sync(&o.db, Path::new(d), o.threads)?;
                 println!(
                     "{records} records from {files} files in {:.1}s ({:.0} rec/s)",
                     el,
                     records as f64 / el.max(0.001)
                 );
+                // Silence here would be the defect: a foreign format parses as
+                // valid JSON, is stored, is dumpable -- and has every semantic
+                // column NULL and no full-text entry. Measured on the real
+                // corpus, 45.9% of records legitimately carry no role or tool
+                // (bookkeeping), so the signal is a total absence of extracted
+                // text, not a high share of bare rows.
+                if records > 0 && bare == records {
+                    eprintln!(
+                        "alog: none of the {records} records yielded a role, tool or searchable \
+                         text. The extractor targets Claude Code session files; another format \
+                         is indexed and dumpable, but not searchable."
+                    );
+                }
             }
         }
         "view" => {
             if let Some(d) = o.rest.first() {
-                let (_, records, el) = sync(&o.db, Path::new(d), o.threads)?;
+                let (_, records, _, el) = sync(&o.db, Path::new(d), o.threads)?;
                 if records > 0 {
                     println!("indexed {records} records in {el:.1}s");
                 }
@@ -291,7 +304,7 @@ fn ro(db: &Path) -> Result<rusqlite::Connection, String> {
 /// Scan in parallel, write serially: SQLite admits one writer, and the scan is
 /// the part that scales. Measured 2138 MB/s at 14 threads vs 274 MB/s for a
 /// single-threaded Python scan of the same corpus.
-fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, f64), String> {
+fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, usize, f64), String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("{}: {e}", root.display()))?;
@@ -332,7 +345,7 @@ fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, f64), S
         })
         .collect();
     if todo.is_empty() {
-        return Ok((0, 0, 0.0));
+        return Ok((0, 0, 0, 0.0));
     }
 
     let t0 = Instant::now();
@@ -355,11 +368,13 @@ fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, f64), S
     // 10,470 files is 39 s of pure overhead against ~20 us of real work each.
     let mut files = 0usize;
     let mut records = 0usize;
+    let mut bare = 0usize;
     let mut batch = Vec::with_capacity(64);
     let flush = |batch: &mut Vec<store::Scanned>,
-                     con: &mut rusqlite::Connection,
-                     files: &mut usize,
-                     records: &mut usize|
+                 con: &mut rusqlite::Connection,
+                 files: &mut usize,
+                 records: &mut usize,
+                 bare: &mut usize|
      -> Result<(), String> {
         if batch.is_empty() {
             return Ok(());
@@ -370,6 +385,13 @@ fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, f64), S
             if n > 0 {
                 *files += 1;
                 *records += n;
+                *bare += s
+                    .rows
+                    .iter()
+                    .filter(|r| {
+                        r.role.is_none() && r.tool.is_none() && r.text.is_empty()
+                    })
+                    .count();
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -379,11 +401,11 @@ fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, f64), S
     for s in rx {
         batch.push(s);
         if batch.len() == 64 {
-            flush(&mut batch, &mut con, &mut files, &mut records)?;
+            flush(&mut batch, &mut con, &mut files, &mut records, &mut bare)?;
         }
     }
-    flush(&mut batch, &mut con, &mut files, &mut records)?;
-    Ok((files, records, t0.elapsed().as_secs_f64()))
+    flush(&mut batch, &mut con, &mut files, &mut records, &mut bare)?;
+    Ok((files, records, bare, t0.elapsed().as_secs_f64()))
 }
 
 fn dump(con: &rusqlite::Connection, session: Option<&str>) -> Result<(), String> {

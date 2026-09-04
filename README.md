@@ -1,7 +1,7 @@
 # alog
 
-Your agent framework already writes `.jsonl` session files. alog indexes them in place —
-read-only, never touching them — so 2.7M events answer in milliseconds.
+Claude Code already writes your sessions as `.jsonl`. alog indexes them in place — read-only,
+never touching them — so 2.7M events answer in milliseconds.
 
 ```console
 $ alog view ~/.claude/projects
@@ -137,14 +137,19 @@ Or build from source: `cargo build --release`, binary at `target/release/alog`.
 
 ## Roadmap
 
-**v0.1 — now.** Rust core, SQLite index, full-text search, timeline, error feed, filtered
-dump, snapshot, viewer. Claude Code and Codex CLI session formats.
+**v0.1 — now.** Rust core, SQLite index, full-text search, timeline, error feed, byte-identical
+dump, snapshot, viewer. **Claude Code session files only.** Any `.jsonl` is indexed and every
+record stays dumpable, but the semantic columns (`role`, `model`, `tool`, `target`, tokens) and
+the full-text index are filled by a Claude Code extractor. Measured on 5 Codex CLI rollout
+files: 48 records indexed, 0 full-text documents, and those columns 100% NULL — Codex nests its
+content under `payload`, so it needs its own extractor.
 
 **v0.2.**
 - Prebuilt binaries for macOS, Linux (glibc and musl), Windows.
+- A Codex CLI extractor, then OpenHands event streams, SWE-agent `.traj`, and OpenTelemetry
+  GenAI spans. Format detection per file, not per store.
 - Linux measurement. Every number here is macOS/APFS; `fsync` semantics differ on Linux, so
   the durability section is Darwin-only until measured.
-- More formats: OpenHands event streams, SWE-agent `.traj`, OpenTelemetry GenAI spans.
 - fts5 exact-duplicate collapse: index identical text once, keep every `(session, seq)` hit,
   so coverage is unchanged.
 
