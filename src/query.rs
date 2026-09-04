@@ -215,30 +215,113 @@ pub fn search(con: &Connection, term: &str, limit: usize, snippets: bool) -> Str
     out
 }
 
-/// ~9 tokens per event, so an 80-step window is ~720 tokens.
-pub fn outline(con: &Connection, ext: &str, start: i64, limit: usize) -> String {
-    let found: rusqlite::Result<(i64, i64)> = con.query_row(
+/// A turn is one user request and everything the agent did to answer it.
+/// Claude Code writes no turn marker, so it is derived: a `user` record with
+/// is_err NULL is a real prompt (a tool result always carries is_err 0 or 1 --
+/// measured 1,397 real prompts against 15,416 tool results), and a turn only
+/// counts if an assistant record follows, which drops the framework's injected
+/// pseudo-prompts.
+///
+/// Tokens are counted once per LLM call, not once per record. One call emits a
+/// record per content block (reasoning, text, tool_use) and copies the whole
+/// usage object onto each, so summing naively inflates the total: measured
+/// 29,527 assistant records against 18,126 distinct usages corpus-wide, and on
+/// one session 2,004,301 output tokens claimed against 961,499 real.
+pub const TURNS: &str = "WITH t AS (
+    SELECT seq, ts, kind, tool, is_err, in_tok, out_tok, cache_r,
+           sum(kind = 'user' AND is_err IS NULL) OVER (ORDER BY seq) AS turn,
+           lag(in_tok)  OVER (ORDER BY seq) AS pi,
+           lag(out_tok) OVER (ORDER BY seq) AS po,
+           lag(cache_r) OVER (ORDER BY seq) AS pc
+    FROM ev WHERE sid = ?1
+), u AS (
+    SELECT *, (out_tok IS NOT NULL
+               AND (in_tok IS NOT pi OR out_tok IS NOT po OR cache_r IS NOT pc)) AS newcall
+    FROM t
+) SELECT turn, min(seq), min(ts), max(ts), count(*), sum(tool IS NOT NULL),
+         sum(is_err = 1), sum(newcall),
+         sum(CASE WHEN newcall THEN coalesce(in_tok,0)  ELSE 0 END),
+         sum(CASE WHEN newcall THEN coalesce(out_tok,0) ELSE 0 END),
+         sum(CASE WHEN newcall THEN coalesce(cache_r,0) ELSE 0 END)
+  FROM u WHERE turn > 0 GROUP BY turn HAVING sum(kind = 'assistant') > 0
+  ORDER BY turn";
+
+fn session(con: &Connection, ext: &str) -> Result<(i64, i64), String> {
+    match con.query_row(
         "SELECT sid, n_ev FROM run WHERE ext=?1",
         rusqlite::params![ext],
         |r| Ok((r.get(0)?, r.get(1)?)),
-    );
-    let (sid, n_ev) = match found {
-        Ok(v) => v,
+    ) {
+        Ok(v) => Ok(v),
         Err(_) => {
-            let mut st = match con.prepare("SELECT ext FROM run LIMIT 2000") {
-                Ok(s) => s,
-                Err(e) => return e.to_string(),
-            };
+            let mut st = con.prepare("SELECT ext FROM run LIMIT 2000")
+                .map_err(|e| e.to_string())?;
             let all: Vec<String> = st
                 .query_map([], |r| r.get(0))
                 .map(|i| i.flatten().collect())
                 .unwrap_or_default();
-            let near = closest(ext, all.iter().map(|s| s.as_str()), 5);
-            return format!(
+            Err(format!(
                 "{{\"code\":\"ALOG_UNKNOWN_SESSION\",\"message\":{:?},\"candidates\":{:?}}}",
-                ext, near
-            );
+                ext,
+                closest(ext, all.iter().map(|s| s.as_str()), 5)
+            ))
         }
+    }
+}
+
+/// One line per turn: what was asked, how much work it took, what it cost.
+pub fn turns(con: &Connection, ext: &str, limit: usize) -> String {
+    let (sid, _) = match session(con, ext) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut st = match con.prepare(TURNS) {
+        Ok(s) => s,
+        Err(e) => return e.to_string(),
+    };
+    let rows: Vec<(i64, i64, Option<i64>, Option<i64>, i64, i64, i64, i64, i64, i64, i64)> =
+        st.query_map(rusqlite::params![sid], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?))
+        })
+        .map(|i| i.flatten().collect())
+        .unwrap_or_default();
+    let mut out = format!("session={ext} turns={}", rows.len());
+    out.push_str("\nturn\twhen\tmins\tev\tcalls\ttools\terr\tin\tout\tcache\task");
+    for (i, (_, s0, t0, t1, n, tools, err, calls, itok, otok, ctok)) in
+        rows.iter().take(limit).enumerate()
+    {
+        let mins = match (t0, t1) {
+            (Some(a), Some(b)) => format!("{:.0}", (b - a) as f64 / 60000.0),
+            _ => String::new(),
+        };
+        let _ = write!(
+            out,
+            "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            i + 1,
+            t0.map(crate::fmt_ts).unwrap_or_default(),
+            mins,
+            n,
+            calls,
+            tools,
+            if *err > 0 { err.to_string() } else { String::new() },
+            itok,
+            otok,
+            ctok,
+            trunc(&preview(con, sid, *s0, 70), 70)
+        );
+    }
+    if rows.len() > limit {
+        let _ = write!(out, "\nTRUNCATED at limit={limit}, {} turns total", rows.len());
+    }
+    out
+}
+
+/// ~9 tokens per event, so an 80-step window is ~720 tokens.
+pub fn outline(con: &Connection, ext: &str, start: i64, limit: usize) -> String {
+    let (sid, n_ev) = match session(con, ext) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
     let mut st = match con.prepare(&format!(
         "SELECT seq, ts, kind, role, tool, target, is_err, len FROM ev

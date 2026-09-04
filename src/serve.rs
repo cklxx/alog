@@ -59,6 +59,7 @@ fn handle(req: Request, db: &Path) {
         "/stats" => stats(&con),
         "/sessions" => sessions(&con, n("limit", 300)),
         "/timeline" => timeline(&con, n("sid", -1), n("start", 0), n("limit", 300)),
+        "/turns" => turns(&con, n("sid", -1)),
         "/record" => record(&con, n("sid", -1), n("seq", -1)),
         "/search" => search(&con, &q("q").unwrap_or_default(), n("limit", 60)),
         "/errors" => errors(&con, n("limit", 120)),
@@ -176,13 +177,26 @@ fn stats(con: &Connection) -> Result<String, String> {
     ))
 }
 
+/// Tokens are summed once per LLM call. One call writes a record per content
+/// block and copies the whole usage object onto each, so a naive sum inflates
+/// the total 1.63x corpus-wide (29,527 assistant records, 18,126 real calls).
 fn sessions(con: &Connection, limit: i64) -> Result<String, String> {
     let mut st = con
         .prepare(
-            "SELECT r.ext, r.sid, r.n_ev, min(e.ts), max(e.ts), sum(e.is_err = 1),
-                    sum(coalesce(e.in_tok,0) + coalesce(e.out_tok,0))
-             FROM run r LEFT JOIN ev e USING (sid)
-             GROUP BY r.sid ORDER BY max(e.ts) DESC LIMIT ?1",
+            "WITH u AS (
+               SELECT sid, seq, ts, is_err, in_tok, out_tok,
+                 (out_tok IS NOT NULL AND (
+                    in_tok  IS NOT lag(in_tok)  OVER (PARTITION BY sid ORDER BY seq) OR
+                    out_tok IS NOT lag(out_tok) OVER (PARTITION BY sid ORDER BY seq) OR
+                    cache_r IS NOT lag(cache_r) OVER (PARTITION BY sid ORDER BY seq)
+                 )) AS newcall
+               FROM ev
+             )
+             SELECT r.ext, r.sid, r.n_ev, min(u.ts), max(u.ts), sum(u.is_err = 1),
+                    sum(CASE WHEN u.newcall
+                        THEN coalesce(u.in_tok,0) + coalesce(u.out_tok,0) ELSE 0 END)
+             FROM run r LEFT JOIN u ON u.sid = r.sid
+             GROUP BY r.sid ORDER BY max(u.ts) DESC LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
     let rows: Vec<String> = st
@@ -202,6 +216,33 @@ fn sessions(con: &Connection, limit: i64) -> Result<String, String> {
         .flatten()
         .collect();
     Ok(format!("[{}]", rows.join(",")))
+}
+
+/// One row per user request, so the timeline can collapse to the shape a reader
+/// thinks in -- what was asked, what it took -- instead of a flat event list.
+/// Claude Code writes no turn marker; see query::TURNS for how it is derived.
+fn turns(con: &Connection, sid: i64) -> Result<String, String> {
+    let mut st = con.prepare(crate::query::TURNS).map_err(|e| e.to_string())?;
+    let raw: Vec<(i64, Option<i64>, Option<i64>, i64, i64, Option<i64>, i64, i64, i64, i64)> = st
+        .query_map(params![sid], |r| {
+            Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    let rows: Vec<String> = raw
+        .iter()
+        .map(|(s0, t0, t1, n, tools, err, calls, i, o, c)| {
+            format!(
+                "{{\"seq\":{s0},\"t0\":{},\"t1\":{},\"n\":{n},\"calls\":{calls},\
+                  \"tools\":{tools},\"err\":{},\"in\":{i},\"out\":{o},\"cache\":{c},\"ask\":{}}}",
+                jnum(*t0), jnum(*t1), err.unwrap_or(0),
+                jstr(&preview(con, sid, *s0, 160))
+            )
+        })
+        .collect();
+    Ok(format!("{{\"turns\":[{}]}}", rows.join(",")))
 }
 
 /// Each row carries a text preview read from the source file: without it, 37%
@@ -355,4 +396,48 @@ fn errors(con: &Connection, limit: i64) -> Result<String, String> {
         })
         .collect();
     Ok(format!("{{\"rows\":[{}]}}", out.join(",")))
+}
+
+#[cfg(test)]
+mod tests {
+    /// A stray brace in viewer.html silently blanks the whole page: the browser
+    /// refuses the script and renders an empty body, with no request logged and
+    /// no error anywhere alog can see. One leftover `}` from an edit did exactly
+    /// that. Parse the script with a real JS engine -- bun, else node -- and
+    /// skip only if neither is installed.
+    #[test]
+    fn viewer_script_parses() {
+        let s = super::VIEWER;
+        let js = &s[s.find("<script>").unwrap() + 8..s.rfind("</script>").unwrap()];
+        let dir = std::env::temp_dir().join(format!("alog-js{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("viewer.js");
+        std::fs::write(&f, js).unwrap();
+        // `bun --check` and `node --check` EXECUTE the file, so `document` is
+        // undefined and every run fails. new Function() parses without running.
+        let probe = dir.join("probe.js");
+        std::fs::write(
+            &probe,
+            "const s=require('fs').readFileSync(process.argv[2],'utf8');\n\
+             try{new Function(s)}catch(e){console.error(e.message);process.exit(1)}",
+        )
+        .unwrap();
+        for engine in ["bun", "node"] {
+            let out = std::process::Command::new(engine)
+                .arg(&probe)
+                .arg(&f)
+                .output();
+            if let Ok(o) = out {
+                assert!(
+                    o.status.success(),
+                    "viewer.html script is not valid JS ({engine}):\n{}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("skipped: neither bun nor node is installed");
+    }
 }

@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <title>alog</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>▤</text></svg>">
 <style>
 :root {
   --bg: #fbfbfa; --panel: #fff; --line: #e6e4e1; --ink: #1b1a18; --dim: #78736c;
@@ -98,7 +99,8 @@ tr.err td.k { color: var(--err); font-weight: 500; }
   <span class="s" id="hdr"></span>
   <input type="search" id="q" placeholder="search all sessions…  fsync   &quot;connection refused&quot;   err*">
   <div class="tabs">
-    <button data-v="timeline" class="on">Timeline</button>
+    <button data-v="turns" class="on">Turns</button>
+    <button data-v="timeline">Events</button>
     <button data-v="errors">Errors</button>
     <button data-v="stats">Stats</button>
   </div>
@@ -121,7 +123,7 @@ const mb = b => b >= 1e9 ? (b/1e9).toFixed(1)+' GB' : (b/1e6).toFixed(0)+' MB';
 const clock = ms => ms ? new Date(ms).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
 const day = ms => ms ? new Date(ms).toLocaleDateString([], {month:'short',day:'numeric'}) : '';
 
-let S = {sessions: [], sid: null, view: 'timeline'};
+let S = {sessions: [], sid: null, view: 'turns'};
 
 document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x === b));
@@ -173,17 +175,57 @@ function tab(v) {
 function render() {
   if (S.view === 'stats') return stats();
   if (S.view === 'errors') return errors();
-  if (S.sid != null) timeline(S.sid, 0);
+  if (S.sid == null) return;
+  if (S.view === 'turns') return turns(S.sid);
+  timeline(S.sid, 0);
+}
+
+/// One row per user request. Click a row to open that turn's events.
+async function turns(sid) {
+  const d = await api('/turns', {sid});
+  if (!d.turns.length) return $('#main').innerHTML =
+    '<div class="empty">no turns — this session has no user prompt followed by a reply</div>';
+  const out = [];
+  let lastDay = '';
+  d.turns.forEach((t, i) => {
+    const dy = day(t.t0);
+    if (dy && dy !== lastDay) { out.push(`<tr class="gap"><td colspan="8">${dy}</td></tr>`); lastDay = dy; }
+    const mins = t.t0 && t.t1 ? Math.round((t.t1 - t.t0) / 60000) : '';
+    out.push(`<tr class="ev ${t.err ? 'err' : ''}" data-seq="${t.seq}">
+      <td class="seq">${i + 1}</td>
+      <td class="t">${clock(t.t0)}</td>
+      <td class="num">${mins ? mins + 'm' : ''}</td>
+      <td class="num">${t.calls}</td>
+      <td class="num">${t.tools}</td>
+      <td class="num">${t.err ? `<b style="color:var(--err)">${t.err}</b>` : ''}</td>
+      <td class="num">${num(t.out)}/${num(t.cache)}</td>
+      <td><div class="snip">${esc(t.ask)}</div></td>
+    </tr>`);
+  });
+  $('#main').innerHTML = `<table>
+    <thead><tr><th>#</th><th>start</th><th>took</th><th>calls</th><th>tools</th><th>err</th>
+    <th>out/cache tok</th><th>asked</th></tr></thead><tbody>${out.join('')}</tbody></table>`;
+  $('#main').onclick = e => {
+    const tr = e.target.closest('tr.ev');
+    if (!tr) return;
+    // Set the tab without letting render() reset the window to seq 0.
+    S.view = 'timeline';
+    document.querySelectorAll('.tabs button').forEach(x =>
+      x.classList.toggle('on', x.dataset.v === 'timeline'));
+    timeline(sid, +tr.dataset.seq);
+  };
 }
 
 const PAGE = 400;
 
-async function timeline(sid, start) {
+// append=true continues the current page; false replaces it, which is what a
+// jump from the Turns view needs even though its start is not 0.
+async function timeline(sid, start, append) {
   const d = await api('/timeline', {sid, start, limit: PAGE});
   // Day separators are inserted client-side: the boundary depends on the
   // reader's timezone, which the server does not know.
   const out = [];
-  let lastDay = start ? S.lastDay : '';
+  let lastDay = append ? S.lastDay : '';
   for (const r of d.rows) {
     const dy = day(r.ts);
     if (dy && dy !== lastDay) {
@@ -203,14 +245,14 @@ async function timeline(sid, start) {
     </tr>`);
   }
   S.lastDay = lastDay;
-  S.seen = (start ? S.seen : 0) + d.rows.length;
+  S.seen = (append ? S.seen : 0) + d.rows.length;
 
   const next = d.rows.length ? d.rows[d.rows.length - 1].seq + 1 : 0;
   const foot = d.rows.length === PAGE
     ? `<button class="more" data-next="${next}">${num(d.n_shown - S.seen)} more</button>`
     : d.hidden ? `<div class="empty">${num(d.hidden)} framework events hidden</div>` : '';
 
-  if (start) {
+  if (append) {
     $('#main .more')?.remove();
     $('#main tbody').insertAdjacentHTML('beforeend', out.join(''));
     $('#main').insertAdjacentHTML('beforeend', foot);
@@ -222,19 +264,7 @@ async function timeline(sid, start) {
   }
   $('#main').onclick = e => {
     const m = e.target.closest('.more');
-    if (m) return timeline(sid, +m.dataset.next);
-    const tr = e.target.closest('tr.ev');
-    if (tr) show(sid, +tr.dataset.seq);
-  };
-}
-  const foot = [];
-  if (d.rows.length < d.n_shown) foot.push(`showing ${d.rows.length} of ${num(d.n_shown)}`);
-  if (d.hidden) foot.push(`${num(d.hidden)} framework events hidden`);
-  $('#main').innerHTML = `<table>
-    <thead><tr><th>#</th><th>time</th><th>who</th><th>tool</th><th>target</th>
-    <th>tok in/out</th><th>size</th></tr></thead><tbody>${out.join('')}</tbody></table>
-    ${foot.length ? `<div class="empty">${foot.join(' \u00b7 ')}</div>` : ''}`;
-  $('#main').onclick = e => {
+    if (m) return timeline(sid, +m.dataset.next, true);
     const tr = e.target.closest('tr.ev');
     if (tr) show(sid, +tr.dataset.seq);
   };

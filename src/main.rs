@@ -16,6 +16,7 @@ USAGE
   alog view [<dir>]             scan if needed, then open the browser viewer
   alog search <query>           full-text search; fts5 syntax
   alog show <session> [seq]     one session's timeline, or one record
+  alog turns <session>          one line per user request: work, cost, errors
   alog sql <query>              read-only SQL over the index
   alog catalog                  what is in the store, schema and distributions
   alog errors                   failed tool calls, newest first
@@ -178,6 +179,14 @@ fn run(args: &[String]) -> Result<(), String> {
                     query::outline(&con, ext, 0, if o.limit == 0 { 80 } else { o.limit })
                 ),
             }
+        }
+        "turns" => {
+            let con = ro(&o.db)?;
+            let ext = o.rest.first().ok_or("turns needs a session")?;
+            println!(
+                "{}",
+                query::turns(&con, ext, if o.limit == 0 { 60 } else { o.limit })
+            );
         }
         "sql" => {
             let con = ro(&o.db)?;
