@@ -28,7 +28,6 @@ OPTIONS
   --db <path>     index location (default ~/.alog/index.db, or $ALOG_DB)
   --limit <n>     max rows (default 50; search 20)
   --port <n>      viewer port (default 8877)
-  --json          machine-readable output
   --no-snippets   skip source reads in search results
   -j <n>          scan threads (default: cores)
 ";
@@ -53,7 +52,6 @@ struct Opts {
     db: PathBuf,
     limit: usize,
     port: u16,
-    json: bool,
     snippets: bool,
     threads: usize,
     rest: Vec<String>,
@@ -73,7 +71,6 @@ fn parse(args: &[String]) -> Opts {
             }),
         limit: 0,
         port: 8877,
-        json: false,
         snippets: true,
         threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         rest: Vec::new(),
@@ -90,7 +87,6 @@ fn parse(args: &[String]) -> Opts {
             "--limit" | "-n" => o.limit = val().parse().unwrap_or(50),
             "--port" => o.port = val().parse().unwrap_or(8877),
             "-j" => o.threads = val().parse().unwrap_or(o.threads).max(1),
-            "--json" => o.json = true,
             "--no-snippets" => o.snippets = false,
             _ => o.rest.push(a.to_string()),
         }
