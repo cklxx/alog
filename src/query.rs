@@ -1,4 +1,5 @@
 use rusqlite::Connection;
+use crate::store::read_record;
 use std::fmt::Write as _;
 
 pub const COLS: &[&str] = &[
@@ -6,8 +7,8 @@ pub const COLS: &[&str] = &[
     "out_tok", "cache_r", "is_err",
 ];
 
-/// Rows an agent or a human reads. 57.5% of events in a real session are
-/// framework bookkeeping, so this filter runs in SQL, not in the client.
+/// Rows an agent or a human reads. 44.2% of the corpus is framework
+/// bookkeeping, so this filter runs in SQL, not in the client.
 pub const KEEP: &str = "(is_err = 1 OR tool IS NOT NULL OR role IS NOT NULL
      OR kind IN ('assistant','user','system','result','failed','tool_result'))";
 
@@ -261,8 +262,14 @@ pub fn outline(con: &Connection, ext: &str, start: i64, limit: usize) -> String 
             let _ = write!(out, " (more: start={})", last + 1);
         }
     }
-    out.push_str("\nseq\twhen\tkind\trole\ttool\ttarget\terr\tbytes");
+    out.push_str("\nseq\twhen\tkind\trole\ttool\terr\tbytes\twhat");
     for (seq, ts, kind, role, tool, target, err, len) in rows {
+        // Same fallback the viewer needs: without it 121 of 400 rows on a real
+        // session print as a bare role and nothing else.
+        let what = match target {
+            Some(t) => trunc(&t, 90),
+            None => trunc(&preview(con, sid, seq, 90), 90),
+        };
         let _ = write!(
             out,
             "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -271,9 +278,9 @@ pub fn outline(con: &Connection, ext: &str, start: i64, limit: usize) -> String 
             kind.as_deref().unwrap_or(""),
             role.as_deref().unwrap_or(""),
             tool.as_deref().unwrap_or(""),
-            trunc(target.as_deref().unwrap_or(""), 70),
             if err == Some(1) { "ERR" } else { "" },
-            len
+            len,
+            what
         );
     }
     out
@@ -451,4 +458,82 @@ fn lev(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+// ----------------------------------------------------------- preview
+
+/// First line of readable text from the source record.
+pub fn preview(con: &Connection, sid: i64, seq: i64, cap: usize) -> String {
+    let raw = match read_record(con, sid, seq) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => return String::from_utf8_lossy(&raw[..raw.len().min(cap)]).into_owned(),
+    };
+    let msg = v.get("message").filter(|m| m.is_object()).unwrap_or(&v);
+    let mut buf = String::new();
+    collect_text(msg.get("content").unwrap_or(&serde_json::Value::Null), &mut buf);
+    // A `system` record has no message.content at all; its subtype is the only
+    // human-readable field. A redacted thinking block leaves an empty string
+    // behind, and 77 of 400 timeline rows were that -- all with real token
+    // counts, so they are dropped from neither the index nor the view.
+    if buf.is_empty() {
+        if let Some(s) = v.get("subtype").and_then(|s| s.as_str()) {
+            buf.push_str(s);
+        } else if has_thinking(msg.get("content")) {
+            buf.push_str("(thinking)");
+        }
+    }
+    let flat: String = buf.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > cap {
+        let t: String = flat.chars().take(cap).collect();
+        format!("{t}…")
+    } else {
+        flat
+    }
+}
+
+fn has_thinking(v: Option<&serde_json::Value>) -> bool {
+    v.and_then(|c| c.as_array()).is_some_and(|a| {
+        a.iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+    })
+}
+
+fn collect_text(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::String(s) => {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(s);
+        }
+        serde_json::Value::Array(a) => {
+            for x in a {
+                collect_text(x, out);
+            }
+        }
+        serde_json::Value::Object(m) => {
+            // `thinking` before `text`: a thinking block carries no text key, and
+            // a whole assistant turn can be nothing but thinking.
+            for k in ["text", "thinking", "content"] {
+                if let Some(x) = m.get(k) {
+                    collect_text(x, out);
+                    return;
+                }
+            }
+            if m.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                if let Some(serde_json::Value::Object(inp)) = m.get("input") {
+                    for x in inp.values() {
+                        if x.is_string() {
+                            collect_text(x, out);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }

@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use tiny_http::{Header, Request, Response, Server};
 
-use crate::query::{snip, terms_of, KEEP};
+use crate::query::{preview, snip, terms_of, KEEP};
 use crate::store::{open_ro, read_record};
 
 const VIEWER: &str = include_str!("viewer.html");
@@ -262,82 +262,6 @@ fn timeline(con: &Connection, sid: i64, start: i64, limit: i64) -> Result<String
         n_ev - shown,
         rows.join(",")
     ))
-}
-
-/// First line of readable text from the source record.
-fn preview(con: &Connection, sid: i64, seq: i64, cap: usize) -> String {
-    let raw = match read_record(con, sid, seq) {
-        Ok(b) => b,
-        Err(_) => return String::new(),
-    };
-    let v: serde_json::Value = match serde_json::from_slice(&raw) {
-        Ok(v) => v,
-        Err(_) => return String::from_utf8_lossy(&raw[..raw.len().min(cap)]).into_owned(),
-    };
-    let msg = v.get("message").filter(|m| m.is_object()).unwrap_or(&v);
-    let mut buf = String::new();
-    collect_text(msg.get("content").unwrap_or(&serde_json::Value::Null), &mut buf);
-    // A `system` record has no message.content at all; its subtype is the only
-    // human-readable field. A redacted thinking block leaves an empty string
-    // behind, and 77 of 400 timeline rows were that -- all with real token
-    // counts, so they are dropped from neither the index nor the view.
-    if buf.is_empty() {
-        if let Some(s) = v.get("subtype").and_then(|s| s.as_str()) {
-            buf.push_str(s);
-        } else if has_thinking(msg.get("content")) {
-            buf.push_str("(thinking)");
-        }
-    }
-    let flat: String = buf.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > cap {
-        let t: String = flat.chars().take(cap).collect();
-        format!("{t}…")
-    } else {
-        flat
-    }
-}
-
-fn has_thinking(v: Option<&serde_json::Value>) -> bool {
-    v.and_then(|c| c.as_array()).is_some_and(|a| {
-        a.iter()
-            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
-    })
-}
-
-fn collect_text(v: &serde_json::Value, out: &mut String) {
-    match v {
-        serde_json::Value::String(s) => {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(s);
-        }
-        serde_json::Value::Array(a) => {
-            for x in a {
-                collect_text(x, out);
-            }
-        }
-        serde_json::Value::Object(m) => {
-            // `thinking` before `text`: a thinking block carries no text key, and
-            // a whole assistant turn can be nothing but thinking.
-            for k in ["text", "thinking", "content"] {
-                if let Some(x) = m.get(k) {
-                    collect_text(x, out);
-                    return;
-                }
-            }
-            if m.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                if let Some(serde_json::Value::Object(inp)) = m.get("input") {
-                    for x in inp.values() {
-                        if x.is_string() {
-                            collect_text(x, out);
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 fn record(con: &Connection, sid: i64, seq: i64) -> Result<String, String> {
