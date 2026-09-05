@@ -76,6 +76,28 @@ pass there with no source change.
 
 `fsync` is still unmeasured off Darwin, so the durability section below remains Darwin-only.
 
+### Why an index at all
+
+`ripgrep` can read the same files with no index, no daemon, no database — so the
+index has to earn its 13.5%. Measured over the same `*.jsonl` files, warm cache,
+median of 15 runs ([bench/RESULTS.md](bench/RESULTS.md), reproduce with
+`bash bench/bench.sh`):
+
+| corpus | ripgrep `-c` | alog | |
+|---|---|---|---|
+| 100 MB | 102 ms | 57 ms | 2× |
+| 1 GB | 152 ms | 52 ms | 3× |
+| 5 GB | 501 ms | 51 ms | **10×** |
+
+ripgrep grows linearly; the index does not. And ~50 ms of alog's 51 is process
+startup — `alog --version` costs 49 ms — so in-process the engine answers a
+single-term query in **0.02 ms at every scale**, because an fts5 lookup is
+proportional to hits, not bytes. Cold-cache the gap widens to ~100×, since
+ripgrep must pull 5 GB through the disk.
+
+Against a 39.8 s build for 5 GB, the index repays itself after 88 queries — or
+on the first one that needs ranking, which `-c` cannot do at any price.
+
 ## Why not a directory of jsonl files
 
 They work until you have 500. Then:
