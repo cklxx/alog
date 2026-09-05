@@ -1,15 +1,18 @@
 # alog
 
-Claude Code already writes your sessions as `.jsonl`. alog indexes them in place — read-only,
-never touching them — so 2.7M events answer in milliseconds.
+Claude Code and Codex CLI already write your sessions as `.jsonl`. alog indexes them in place
+— read-only, never touching them — so 4.4M events answer in milliseconds.
 
 ```console
-$ alog view ~/.claude/projects
-2769145 records from 10470 files in 41.6s (66556 rec/s)
+$ alog view
+2769145 records from 10470 files in 42.5s (65084 rec/s)  ~/.claude/projects
+1613204 records from  3151 files in 35.4s (45516 rec/s)  ~/.codex/sessions
 serving http://127.0.0.1:8877
 ```
 
-One 2.6 MB binary. No runtime, no interpreter, no build step.
+No path needed: `sync` and `view` find every framework's session directory under `~`.
+
+One 2.6 MB binary. No runtime, no interpreter, no daemon.
 
 - **Your files stay yours.** Opened read-only. Never written, moved, or locked.
 - **The index is disposable.** Delete it, re-sync, lose nothing but time.
@@ -19,24 +22,59 @@ One 2.6 MB binary. No runtime, no interpreter, no build step.
 
 Apple M4 Pro, APFS/NVMe, SQLite 3.50.2 bundled. Corpus: **10,470 real Claude Code session
 files, 5.62 GB, 2,769,145 records** — the full set, not a sample. Query latencies are the
-median of 3 warm runs.
+median of 3 warm runs. A second column gives the same figures over the whole Codex CLI
+corpus: **3,151 files, 3.73 GB, 1,613,204 records**.
 
-| | |
-|---|---|
-| ingest | **66,556 rec/s** — 41.6 s for 5.62 GB, 14 threads |
-| re-sync, nothing changed | **0.6 s** for 10,470 files |
-| parse failures | **0** of 2,769,145 |
-| index size | **763 MB = 13.6%** of source |
-| single-term search | **2 ms** over 1,181,013 documents |
-| phrase search | **2 ms** |
-| 50 newest failed tool calls | **116 ms**, or **17 ms** after `alog index err` |
-| session timeline, 400 rows + previews | **28 ms** |
-| catalog for an agent | **1,669 bytes** |
-| binary | **2.6 MB**, no runtime |
+| | Claude Code | Codex CLI |
+|---|---|---|
+| ingest | **65,084 rec/s** — 42.5 s, 14 threads | **45,516 rec/s** — 35.4 s |
+| re-sync, nothing changed | **0.5 s** for 10,470 files | **0.3 s** for 3,151 files |
+| parse failures | **0** of 2,769,145 | **0** of 1,613,204 |
+| index size | **756 MB = 13.5%** of source | **650 MB = 17.4%** of source |
+| full-text documents | 1,181,013 | 905,291 |
+| single-term search | **2 ms** | **2 ms** |
+| phrase search | **10 ms** | — |
+| 50 newest failed tool calls | **110 ms**, **20 ms** after `alog index err` | **90 ms** of 9,239 |
+| session timeline, 400 rows + previews | **20 ms** | **10 ms** |
+| catalog for an agent | **1,669 bytes** | **1,570 bytes** |
+
+One 2.6 MB binary, no runtime.
 
 Reproduce with `alog sync <dir> && alog stats`. The index size is what `sync` writes; the
 optional secondary indexes (`alog index err ts target`) add 134.5 MB on top, 17.6% more.
 Search needs no index — fts5 is built during `sync`.
+
+A re-sync of an unchanged corpus reads; it does not `stat`. Each file's last indexed record is
+re-read and re-hashed, because no file metadata can see a file rewritten in place. That costs
+0.5 s over 10,470 files and is why the index cannot go stale — see below.
+
+### Linux
+
+The numbers above are macOS. To compare platforms without moving anyone's sessions, the same
+generator builds the same synthetic corpus on both machines — **800 files, 167 MB, 720,000
+records**, and both produce an identical index: 720,000 rows, 18,400 errors, 720,000 full-text
+documents, 97 MB.
+
+| | macOS arm64 | Linux x86_64 |
+|---|---|---|
+| | M4 Pro, 14 threads, APFS | Xeon 8457C, 64 threads, ext4 |
+| ingest | **296,697 rec/s** — 2.4 s | **153,585 rec/s** — 4.7 s |
+| re-sync, nothing changed | 0.1 s | 0.0 s |
+| single-term search | 90 ms | 173 ms |
+| phrase search | 110 ms | 207 ms |
+| 50 newest failed tool calls | 30 ms | 49 ms |
+| binary | 2.60 MB | 3.10 MB |
+
+Read the ratio, not the rec/s: a synthetic record is 232 bytes against 2,030 in the real
+corpus, so these rates are per-record cheap and are not comparable to the table above. In
+MB/s the same rows read 70 and 36, against 132 on real files.
+
+More threads do not help: ingest is one SQLite writer behind a parallel scan, so the scan
+saturates early and the write serializes. The Linux box was at load average 9.0 with other
+tenants, so treat its latencies as an upper bound. The unit tests and the full end-to-end suite
+pass there with no source change.
+
+`fsync` is still unmeasured off Darwin, so the durability section below remains Darwin-only.
 
 ## Why not a directory of jsonl files
 
@@ -44,9 +82,9 @@ They work until you have 500. Then:
 
 | | jsonl | alog |
 |---|---|---|
-| every session that touched `auth.py` | scan 5.6 GB | 165 ms scan of the index |
+| every session that touched `auth.py` | scan 5.6 GB | 170 ms scan of the index |
 | what did this command print last time | `rg` across 10k files | 2 ms full-text |
-| what broke, and in which tool | grep and hope | `alog errors`, 116 ms |
+| what broke, and in which tool | grep and hope | `alog errors`, 110 ms |
 | hand one session to a colleague | copy a 300 MB file | `alog dump <session>` |
 | what's even in here | `ls`, then guess | 1,669-byte catalog |
 
@@ -61,11 +99,12 @@ transcripts duplicate 93–99% of their content
 ## Commands
 
 ```console
-alog sync <dir>...          index .jsonl files, incrementally
-alog view [<dir>]           scan if needed, then open the viewer
+alog sync [<dir>...]        index sessions; no arg finds them under ~
+alog view [<dir>...]        sync, then open the viewer
 alog search <query>         full-text, fts5 syntax
 alog show <session> [seq]   a session's timeline, or one raw record
 alog sql <query>            read-only SQL over the index
+alog turns <session>        one line per user request: work, cost, errors
 alog catalog                what is in the store, in ~340 tokens
 alog errors                 failed tool calls, newest first
 alog dump [<session>]       byte-identical jsonl to stdout
@@ -110,6 +149,36 @@ The reader is usually a model with a limited context window:
   enough — under it `ATTACH` still succeeds and creates the file, handing an agent an
   arbitrary file-create primitive.
 
+## Staleness
+
+A derived index is only useful if it cannot quietly disagree with its source. Four ways it
+could, all measured on real files and all now closed:
+
+- **A file rewritten in place to the same length.** A secret redacted, a transcript
+  regenerated. `sync` used to skip it on a length comparison and report `0 records from 0
+  files`, leaving 100% of its rows answering for text on no disk anywhere — and because fts5
+  here is contentless, the index held no plaintext for an audit to find. Every count and
+  `PRAGMA integrity_check` still returned ok.
+- **A file rewritten longer.** The old cursor still pointed inside it, so half the index stayed
+  stale: a query for text that existed returned half its hits, and a query for text that was
+  gone returned the other half.
+- **A deleted file.** Its `run` row and its documents survived, answering searches and skewing
+  the corpus-global bm25 IDF that every other session's ranking depends on.
+- **A symlink beside its target.** Followed, so one file was indexed twice at double weight.
+
+`sync` now re-reads and re-hashes each file's last indexed record before trusting its cursor,
+drops sessions whose files are gone, and skips symlinks. No metadata check stands in front of
+that read: `mtime` is as restorable as the length — one `utime` call, which archivers and sync
+tools make routinely — and with an mtime fast-path in place, a same-size rewrite whose mtime
+was restored to the same nanosecond returned 4 stale hits and 0 real ones. `sid` is assigned in sorted path order
+rather than by whichever thread finished first — it is the `ev` primary key and appears in
+every `alog sql` result, and a nondeterministic one changed 99.9% of session ids between two
+builds of the same files.
+
+When a record cannot be verified, the tool says so. A stale search hit prints
+`<...changed on disk; run \`alog sync\`>` in place of its snippet, and `dump` exits non-zero
+rather than writing a short file and reporting success.
+
 ## Durability
 
 `sync` runs at `synchronous=NORMAL`. Committed records survive `kill -9` and OS panic; they do
@@ -132,26 +201,28 @@ create the `-shm` file a WAL database requires.
 ## Install
 
 ```console
-cargo install alog
+git clone https://github.com/cklxx/alog && cd alog && cargo build --release
 ```
 
-Or build from source: `cargo build --release`, binary at `target/release/alog`.
+Binary at `target/release/alog`; copy it anywhere on your `PATH`. CI also
+uploads a build per platform on every push — macOS arm64, Linux x86_64, Linux
+arm64, Windows x86_64.
+
+Not on crates.io: the name `alog` there belongs to an unrelated crate.
 
 ## Roadmap
 
-**v0.1 — now.** Rust core, SQLite index, full-text search, timeline, error feed, byte-identical
-dump, snapshot, viewer. **Claude Code session files only.** Any `.jsonl` is indexed and every
-record stays dumpable, but the semantic columns (`role`, `model`, `tool`, `target`, tokens) and
-the full-text index are filled by a Claude Code extractor. Measured on 5 Codex CLI rollout
-files: 48 records indexed, 0 full-text documents, and those columns 100% NULL — Codex nests its
-content under `payload`, so it needs its own extractor.
+**v0.1 — now.** Rust core, SQLite index, full-text search, timeline, turns, error feed,
+byte-identical dump, snapshot, viewer. **Claude Code and Codex CLI**, detected per record, not
+per store — the two live side by side in one index. Any other `.jsonl` is still indexed and
+stays dumpable, but its semantic columns come back NULL and `sync` says so.
 
 **v0.2.**
-- Prebuilt binaries for macOS, Linux (glibc and musl), Windows.
-- A Codex CLI extractor, then OpenHands event streams, SWE-agent `.traj`, and OpenTelemetry
-  GenAI spans. Format detection per file, not per store.
-- Linux measurement. Every number here is macOS/APFS; `fsync` semantics differ on Linux, so
-  the durability section is Darwin-only until measured.
+- Released prebuilt binaries, and a crates.io name that is not already taken.
+- OpenHands event streams, SWE-agent `.traj`, and OpenTelemetry GenAI spans.
+- `fsync` measurement off Darwin. Ingest and query latency are now measured on Linux x86_64;
+  the durability numbers are not, and `fsync` semantics differ, so that section stays
+  Darwin-only until they are.
 - fts5 exact-duplicate collapse: index identical text once, keep every `(session, seq)` hit,
   so coverage is unchanged. fts5 tokenize+index is the single largest cost in `sync` —
   measured by ablation at 41% of ingest wall time in the Python prototype, not yet re-measured
@@ -172,4 +243,4 @@ searchable bytes, and it is what agents most need to search). A custom on-disk f
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

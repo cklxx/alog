@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # viewer_script_parses needs a JS engine to parse viewer.html; without one
+      # the test reports itself skipped, which would let a blank page through.
+      - uses: oven-sh/setup-bun@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release
+      # The end-to-end path the unit tests cannot reach: real files on disk
+      # through sync, then every read command against the index they produced.
+      # Both formats, and each silent-staleness defect that has been fixed.
+      - name: End-to-end
+        shell: bash
+        run: bash scripts/e2e.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alog-${{ matrix.target }}
+          path: |
+            target/release/alog
+            target/release/alog.exe
+          if-no-files-found: error
+
+  # The MSRV in Cargo.toml is a claim, so it is checked. Build only: the test
+  # and lint tooling tracks stable and would fail here for unrelated reasons.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release

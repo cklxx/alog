@@ -1,5 +1,5 @@
-use rusqlite::Connection;
 use crate::store::read_record;
+use rusqlite::Connection;
 use std::fmt::Write as _;
 
 pub const COLS: &[&str] = &[
@@ -8,9 +8,43 @@ pub const COLS: &[&str] = &[
 ];
 
 /// Rows an agent or a human reads. 44.2% of the corpus is framework
-/// bookkeeping, so this filter runs in SQL, not in the client.
+/// bookkeeping, so this filter runs in SQL, not in the client. The kind list is
+/// Claude Code's; Codex kinds are namespaced, so its content records match on
+/// the prefix and only its noisiest event (token_count) is dropped.
 pub const KEEP: &str = "(is_err = 1 OR tool IS NOT NULL OR role IS NOT NULL
-     OR kind IN ('assistant','user','system','result','failed','tool_result'))";
+     OR kind IN ('assistant','user','system','result','failed','tool_result')
+     OR (kind LIKE 'response_item/%' AND kind != 'response_item/reasoning')
+     OR kind IN ('event_msg/user_message','event_msg/agent_message',
+                 'event_msg/agent_reasoning','event_msg/error'))";
+
+type Nullable = Option<String>;
+/// (ext, sid, seq, ts, kind, tool, target)
+type Hit = (String, i64, i64, Option<i64>, Nullable, Nullable, Nullable);
+/// (turn, first_seq, t0, t1, records, tools, errors, calls, in, out, cache)
+type Turn = (
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+/// (seq, ts, kind, role, tool, target, is_err, len)
+type Step = (
+    i64,
+    Option<i64>,
+    Nullable,
+    Nullable,
+    Nullable,
+    Nullable,
+    Option<i64>,
+    i64,
+);
 
 fn cell(v: &rusqlite::types::ValueRef<'_>, cap: usize) -> String {
     use rusqlite::types::ValueRef as V;
@@ -62,9 +96,8 @@ pub fn catalog(con: &Connection) -> rusqlite::Result<String> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let nulls: Vec<f64> = con.query_row(&sql, [], |r| {
-        (0..probe.len()).map(|i| r.get(i)).collect()
-    })?;
+    let nulls: Vec<f64> =
+        con.query_row(&sql, [], |r| (0..probe.len()).map(|i| r.get(i)).collect())?;
     out.push_str("null%:");
     for (c, v) in probe.iter().zip(&nulls) {
         let _ = write!(out, " {c} {v:.0}");
@@ -72,11 +105,10 @@ pub fn catalog(con: &Connection) -> rusqlite::Result<String> {
     out.push('\n');
 
     for col in ["kind", "tool", "model"] {
-        let total: i64 = con.query_row(
-            &format!("SELECT count(DISTINCT {col}) FROM ev"),
-            [],
-            |r| r.get(0),
-        )?;
+        let total: i64 =
+            con.query_row(&format!("SELECT count(DISTINCT {col}) FROM ev"), [], |r| {
+                r.get(0)
+            })?;
         if total == 0 {
             continue;
         }
@@ -124,9 +156,8 @@ pub fn query(con: &Connection, sql: &str, limit: usize) -> String {
                     more = true;
                     break;
                 }
-                let line: Vec<String> = (0..ncol)
-                    .map(|i| cell(&r.get_ref_unwrap(i), 300))
-                    .collect();
+                let line: Vec<String> =
+                    (0..ncol).map(|i| cell(&r.get_ref_unwrap(i), 300)).collect();
                 body.push(line.join("\t"));
             }
             Ok(None) => break,
@@ -164,21 +195,20 @@ pub fn search(con: &Connection, term: &str, limit: usize, snippets: bool) -> Str
         Ok(s) => s,
         Err(e) => return fts_error(&e.to_string()),
     };
-    let hits: Vec<(String, i64, i64, Option<i64>, Option<String>, Option<String>, Option<String>)> =
-        match st.query_map(rusqlite::params![term, limit as i64 + 1], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
-        }) {
-            Ok(it) => it.flatten().collect(),
-            Err(e) => return fts_error(&e.to_string()),
-        };
+    let hits: Vec<Hit> = match st.query_map(rusqlite::params![term, limit as i64 + 1], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+        ))
+    }) {
+        Ok(it) => it.flatten().collect(),
+        Err(e) => return fts_error(&e.to_string()),
+    };
     let more = hits.len() > limit;
     let hits = &hits[..hits.len().min(limit)];
     let mut out = format!("hits={} elapsed={}ms", hits.len(), t0.elapsed().as_millis());
@@ -206,9 +236,13 @@ pub fn search(con: &Connection, term: &str, limit: usize, snippets: bool) -> Str
             trunc(target.as_deref().unwrap_or(""), 60)
         );
         if snippets {
-            let s = crate::store::read_record(con, *sid, *seq)
-                .map(|b| snip(&String::from_utf8_lossy(&b), &words, 240))
-                .unwrap_or_default();
+            // A read failure is named, never blanked. An empty column here read
+            // as "the match is not quotable", when it meant the source no longer
+            // holds this record and the hit itself is stale.
+            let s = match crate::store::read_record(con, *sid, *seq) {
+                Ok(b) => snip(&String::from_utf8_lossy(&b), &words, 240),
+                Err(e) => format!("<{e}>"),
+            };
             let _ = write!(out, "\t{}", s.replace('\t', " ").replace('\n', "\\n"));
         }
     }
@@ -216,11 +250,13 @@ pub fn search(con: &Connection, term: &str, limit: usize, snippets: bool) -> Str
 }
 
 /// A turn is one user request and everything the agent did to answer it.
-/// Claude Code writes no turn marker, so it is derived: a `user` record with
-/// is_err NULL is a real prompt (a tool result always carries is_err 0 or 1 --
-/// measured 1,397 real prompts against 15,416 tool results), and a turn only
-/// counts if an assistant record follows, which drops the framework's injected
-/// pseudo-prompts.
+/// Neither format marks turns (DSH does: turn/start, step/start, callId), so
+/// the boundary is derived per format:
+///   Claude Code -- kind 'user' with is_err NULL. A tool result always carries
+///     is_err 0 or 1, measured 1,397 real prompts against 15,416 tool results.
+///   Codex -- kind 'event_msg/user_message', which is explicit.
+/// A turn only counts if an assistant record follows, which drops the injected
+/// pseudo-prompts Claude Code writes before the model ever runs.
 ///
 /// Tokens are counted once per LLM call, not once per record. One call emits a
 /// record per content block (reasoning, text, tool_use) and copies the whole
@@ -229,21 +265,26 @@ pub fn search(con: &Connection, term: &str, limit: usize, snippets: bool) -> Str
 /// one session 2,004,301 output tokens claimed against 961,499 real.
 pub const TURNS: &str = "WITH t AS (
     SELECT seq, ts, kind, tool, is_err, in_tok, out_tok, cache_r,
-           sum(kind = 'user' AND is_err IS NULL) OVER (ORDER BY seq) AS turn,
+           sum(kind = 'event_msg/user_message'
+               OR (kind = 'user' AND is_err IS NULL)) OVER (ORDER BY seq) AS turn,
            lag(in_tok)  OVER (ORDER BY seq) AS pi,
            lag(out_tok) OVER (ORDER BY seq) AS po,
            lag(cache_r) OVER (ORDER BY seq) AS pc
     FROM ev WHERE sid = ?1
 ), u AS (
-    SELECT *, (out_tok IS NOT NULL
-               AND (in_tok IS NOT pi OR out_tok IS NOT po OR cache_r IS NOT pc)) AS newcall
+    SELECT *, (out_tok IS NOT NULL AND (
+                 kind = 'event_msg/token_count'
+                 OR in_tok IS NOT pi OR out_tok IS NOT po OR cache_r IS NOT pc
+               )) AS newcall
     FROM t
 ) SELECT turn, min(seq), min(ts), max(ts), count(*), sum(tool IS NOT NULL),
          sum(is_err = 1), sum(newcall),
          sum(CASE WHEN newcall THEN coalesce(in_tok,0)  ELSE 0 END),
          sum(CASE WHEN newcall THEN coalesce(out_tok,0) ELSE 0 END),
          sum(CASE WHEN newcall THEN coalesce(cache_r,0) ELSE 0 END)
-  FROM u WHERE turn > 0 GROUP BY turn HAVING sum(kind = 'assistant') > 0
+  FROM u WHERE turn > 0 GROUP BY turn
+  HAVING sum(kind = 'assistant' OR kind LIKE 'response_item/%'
+             OR kind = 'event_msg/agent_message') > 0
   ORDER BY turn";
 
 fn session(con: &Connection, ext: &str) -> Result<(i64, i64), String> {
@@ -254,7 +295,8 @@ fn session(con: &Connection, ext: &str) -> Result<(i64, i64), String> {
     ) {
         Ok(v) => Ok(v),
         Err(_) => {
-            let mut st = con.prepare("SELECT ext FROM run LIMIT 2000")
+            let mut st = con
+                .prepare("SELECT ext FROM run LIMIT 2000")
                 .map_err(|e| e.to_string())?;
             let all: Vec<String> = st
                 .query_map([], |r| r.get(0))
@@ -279,10 +321,21 @@ pub fn turns(con: &Connection, ext: &str, limit: usize) -> String {
         Ok(s) => s,
         Err(e) => return e.to_string(),
     };
-    let rows: Vec<(i64, i64, Option<i64>, Option<i64>, i64, i64, i64, i64, i64, i64, i64)> =
-        st.query_map(rusqlite::params![sid], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
-                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?))
+    let rows: Vec<Turn> = st
+        .query_map(rusqlite::params![sid], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+            ))
         })
         .map(|i| i.flatten().collect())
         .unwrap_or_default();
@@ -304,7 +357,11 @@ pub fn turns(con: &Connection, ext: &str, limit: usize) -> String {
             n,
             calls,
             tools,
-            if *err > 0 { err.to_string() } else { String::new() },
+            if *err > 0 {
+                err.to_string()
+            } else {
+                String::new()
+            },
             itok,
             otok,
             ctok,
@@ -312,7 +369,11 @@ pub fn turns(con: &Connection, ext: &str, limit: usize) -> String {
         );
     }
     if rows.len() > limit {
-        let _ = write!(out, "\nTRUNCATED at limit={limit}, {} turns total", rows.len());
+        let _ = write!(
+            out,
+            "\nTRUNCATED at limit={limit}, {} turns total",
+            rows.len()
+        );
     }
     out
 }
@@ -330,10 +391,16 @@ pub fn outline(con: &Connection, ext: &str, start: i64, limit: usize) -> String 
         Ok(s) => s,
         Err(e) => return e.to_string(),
     };
-    let rows: Vec<(i64, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, i64)> =
-        st.query_map(rusqlite::params![sid, start, limit as i64], |r| {
+    let rows: Vec<Step> = st
+        .query_map(rusqlite::params![sid, start, limit as i64], |r| {
             Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
                 r.get(7)?,
             ))
         })
@@ -369,8 +436,6 @@ pub fn outline(con: &Connection, ext: &str, start: i64, limit: usize) -> String 
     out
 }
 
-// ------------------------------------------------------------ errors
-
 /// An error a model can act on in one turn: the failing element, the valid
 /// alternatives, and whether the fix is mechanical.
 fn sql_error(con: &Connection, msg: &str) -> String {
@@ -380,7 +445,6 @@ fn sql_error(con: &Connection, msg: &str) -> String {
         msg.split(':')
             .nth(1)
             .unwrap_or("")
-            .trim()
             .split_whitespace()
             .next()
             .unwrap_or("")
@@ -389,10 +453,7 @@ fn sql_error(con: &Connection, msg: &str) -> String {
     let (code, cands) = if low.contains("no such column") {
         let bad = bad_token(msg);
         let bad = bad.as_str();
-        (
-            "ALOG_UNKNOWN_COLUMN",
-            closest(bad, COLS.iter().copied(), 4),
-        )
+        ("ALOG_UNKNOWN_COLUMN", closest(bad, COLS.iter().copied(), 4))
     } else if low.contains("no such table") {
         let bad = bad_token(msg);
         let bad = bad.as_str();
@@ -478,8 +539,6 @@ fn no_rows_hint(con: &Connection, sql: &str) -> Option<String> {
     }
 }
 
-// ------------------------------------------------------------ helpers
-
 fn trunc(s: &str, cap: usize) -> String {
     if s.chars().count() <= cap {
         return s.to_string();
@@ -524,7 +583,11 @@ fn closest<'a>(want: &str, pool: impl Iterator<Item = &'a str>, n: usize) -> Vec
         })
         .collect();
     scored.sort_by_key(|(d, c)| (*d, c.len()));
-    scored.into_iter().take(n).map(|(_, c)| c.to_string()).collect()
+    scored
+        .into_iter()
+        .take(n)
+        .map(|(_, c)| c.to_string())
+        .collect()
 }
 
 fn lev(a: &str, b: &str) -> usize {
@@ -543,8 +606,6 @@ fn lev(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-// ----------------------------------------------------------- preview
-
 /// First line of readable text from the source record.
 pub fn preview(con: &Connection, sid: i64, seq: i64, cap: usize) -> String {
     let raw = match read_record(con, sid, seq) {
@@ -557,13 +618,25 @@ pub fn preview(con: &Connection, sid: i64, seq: i64, cap: usize) -> String {
     };
     let msg = v.get("message").filter(|m| m.is_object()).unwrap_or(&v);
     let mut buf = String::new();
-    collect_text(msg.get("content").unwrap_or(&serde_json::Value::Null), &mut buf);
-    // A `system` record has no message.content at all; its subtype is the only
-    // human-readable field. A redacted thinking block leaves an empty string
-    // behind, and 77 of 400 timeline rows were that -- all with real token
-    // counts, so they are dropped from neither the index nor the view.
+    collect_text(
+        msg.get("content").unwrap_or(&serde_json::Value::Null),
+        &mut buf,
+    );
+    // A `system` record has no message.content; its subtype is the only readable
+    // field. A redacted thinking block leaves an empty string. A Codex record
+    // keeps everything under `payload`, so reuse the extractor rather than
+    // teaching this function a second format.
     if buf.is_empty() {
-        if let Some(s) = v.get("subtype").and_then(|s| s.as_str()) {
+        if v.get("payload").is_some() {
+            if let Some(r) = crate::extract::codex(std::str::from_utf8(&raw).unwrap_or(""), 0, 0, 0)
+            {
+                buf = if r.text.is_empty() {
+                    r.target.unwrap_or_default()
+                } else {
+                    r.text
+                };
+            }
+        } else if let Some(s) = v.get("subtype").and_then(|s| s.as_str()) {
             buf.push_str(s);
         } else if has_thinking(msg.get("content")) {
             buf.push_str("(thinking)");

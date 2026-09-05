@@ -2,7 +2,9 @@
 name = "alog"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.85 is the floor, verified by building on it: a transitive dep (indexmap)
+# requires edition2024, which lands in 1.85. The msrv CI job holds this honest.
+rust-version = "1.85"
 description = "Agent trajectories, queryable. A SQLite index beside the .jsonl your framework already writes."
 license = "MIT"
 repository = "https://github.com/cklxx/alog"

@@ -12,8 +12,8 @@ const USAGE: &str = "\
 alog -- agent trajectories, queryable
 
 USAGE
-  alog sync <dir>...            index .jsonl trajectory files (repeatable, incremental)
-  alog view [<dir>]             scan if needed, then open the browser viewer
+  alog sync [<dir>...]          index sessions; no arg finds them under ~
+  alog view [<dir>...]          sync, then open the browser viewer
   alog search <query>           full-text search; fts5 syntax
   alog show <session> [seq]     one session's timeline, or one record
   alog turns <session>          one line per user request: work, cost, errors
@@ -102,6 +102,33 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Where agent frameworks keep sessions. `sync` and `view` with no argument
+/// index every one that exists, so the common case takes no path at all.
+fn default_roots() -> Vec<PathBuf> {
+    let home = dirs_home();
+    ["/.claude/projects", "/.codex/sessions", "/.dsh/sessions"]
+        .iter()
+        .map(|p| {
+            let mut d = home.clone();
+            d.push(p.trim_start_matches('/'));
+            d
+        })
+        .filter(|d| d.is_dir())
+        .collect()
+}
+
+/// The directories to index: what was asked for, else every framework's own.
+fn roots(given: &[String]) -> Result<Vec<PathBuf>, String> {
+    if !given.is_empty() {
+        return Ok(given.iter().map(PathBuf::from).collect());
+    }
+    let found = default_roots();
+    if found.is_empty() {
+        return Err("no session directory found under ~; pass one".into());
+    }
+    Ok(found)
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let mut o = parse(args);
     if o.rest.is_empty() {
@@ -115,36 +142,36 @@ fn run(args: &[String]) -> Result<(), String> {
 
     match cmd {
         "sync" => {
-            if o.rest.is_empty() {
-                return Err("sync needs a directory".into());
-            }
-            for d in &o.rest {
-                let (files, records, bare, el) = sync(&o.db, Path::new(d), o.threads)?;
+            for d in roots(&o.rest)? {
+                let (files, records, bare, gone, el) = sync(&o.db, &d, o.threads)?;
                 println!(
-                    "{records} records from {files} files in {:.1}s ({:.0} rec/s)",
+                    "{records} records from {files} files in {:.1}s ({:.0} rec/s)  {}",
                     el,
-                    records as f64 / el.max(0.001)
+                    records as f64 / el.max(0.001),
+                    d.display()
                 );
-                // Silence here would be the defect: a foreign format parses as
-                // valid JSON, is stored, is dumpable -- and has every semantic
-                // column NULL and no full-text entry. Measured on the real
-                // corpus, 45.9% of records legitimately carry no role or tool
-                // (bookkeeping), so the signal is a total absence of extracted
-                // text, not a high share of bare rows.
+                if gone > 0 {
+                    println!("dropped {gone} sessions whose files are gone");
+                }
+                // An unknown format parses as valid JSON, stores, and dumps
+                // -- with every semantic column NULL and nothing searchable.
+                // The signal is a total absence of extracted text: 45.9% of
+                // the real corpus legitimately carries no role or tool.
                 if records > 0 && bare == records {
                     eprintln!(
                         "alog: none of the {records} records yielded a role, tool or searchable \
-                         text. The extractor targets Claude Code session files; another format \
+                         text. Claude Code and Codex CLI sessions are understood; this format \
                          is indexed and dumpable, but not searchable."
                     );
                 }
             }
         }
         "view" => {
-            if let Some(d) = o.rest.first() {
-                let (_, records, _, el) = sync(&o.db, Path::new(d), o.threads)?;
-                if records > 0 {
-                    println!("indexed {records} records in {el:.1}s");
+            for d in roots(&o.rest)? {
+                if let Ok((_, records, _, _, el)) = sync(&o.db, &d, o.threads) {
+                    if records > 0 {
+                        println!("indexed {records} records in {el:.1}s  {}", d.display());
+                    }
                 }
             }
             serve::run(&o.db, o.port)?;
@@ -307,9 +334,14 @@ fn ro(db: &Path) -> Result<rusqlite::Connection, String> {
 }
 
 /// Scan in parallel, write serially: SQLite admits one writer, and the scan is
-/// the part that scales. Measured 2138 MB/s at 14 threads vs 274 MB/s for a
-/// single-threaded Python scan of the same corpus.
-fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, usize, f64), String> {
+/// the part that scales. Measured 2138 MB/s at 14 threads.
+///
+/// Returns (files, records, bare, gone, elapsed).
+fn sync(
+    db: &Path,
+    root: &Path,
+    threads: usize,
+) -> Result<(usize, usize, usize, usize, f64), String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("{}: {e}", root.display()))?;
@@ -318,52 +350,113 @@ fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, usize, 
     if paths.is_empty() {
         return Err(format!("no .jsonl files under {}", root.display()));
     }
+    let t0 = Instant::now();
 
-    // Existing cursors, so an unchanged file is skipped without opening it.
-    let mut known = std::collections::HashMap::new();
+    // What the index already holds, and the tail record that proves a cursor is
+    // still valid. Reading it here costs one query; trusting a byte length
+    // instead cost 100% of a rewritten file's rows.
+    let mut known: std::collections::HashMap<String, store::Prev> = Default::default();
     {
         let mut st = con
-            .prepare("SELECT path, sid, cursor, n_ev FROM run")
+            .prepare(
+                "SELECT r.path, r.sid, r.cursor, r.n_ev, e.off, e.len, e.crc
+                 FROM run r LEFT JOIN ev e
+                   ON e.sid = r.sid AND e.seq = r.n_ev - 1",
+            )
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map([], |r| {
+                let tail = match (r.get(4)?, r.get(5)?, r.get(6)?) {
+                    (Some(o), Some(l), Some(c)) => Some((o, l, c)),
+                    _ => None,
+                };
                 Ok((
                     r.get::<_, String>(0)?,
-                    (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?),
+                    store::Prev {
+                        sid: r.get(1)?,
+                        cursor: r.get(2)?,
+                        n_ev: r.get(3)?,
+                        tail,
+                    },
                 ))
             })
             .map_err(|e| e.to_string())?;
-        for row in rows.flatten() {
-            known.insert(row.0, row.1);
+        for (path, prev) in rows.flatten() {
+            known.insert(path, prev);
         }
     }
 
-    let todo: Vec<(PathBuf, Option<i64>, i64, i64)> = paths
-        .into_iter()
-        .filter_map(|p| {
-            let size = std::fs::metadata(&p).ok()?.len() as i64;
-            match known.get(&p.to_string_lossy().to_string()) {
-                Some(&(_, cursor, _)) if cursor == size => None,
-                Some(&(sid, cursor, n_ev)) => Some((p, Some(sid), cursor, n_ev)),
-                None => Some((p, None, 0, 0)),
+    // A source file that is gone must take its rows with it. Only paths under
+    // this root are considered, so syncing one directory never touches another.
+    let live: std::collections::HashSet<&String> = Default::default();
+    let mut live = live;
+    let keys: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into()).collect();
+    for k in &keys {
+        live.insert(k);
+    }
+    let mut gone = 0usize;
+    {
+        let stale: Vec<i64> = known
+            .iter()
+            .filter(|(path, _)| !live.contains(path) && Path::new(path).starts_with(&root))
+            .map(|(_, p)| p.sid)
+            .collect();
+        if !stale.is_empty() {
+            let tx = con.transaction().map_err(|e| e.to_string())?;
+            for sid in &stale {
+                store::forget(&tx, *sid).map_err(|e| e.to_string())?;
+                tx.execute("DELETE FROM run WHERE sid=?1", rusqlite::params![sid])
+                    .map_err(|e| e.to_string())?;
             }
-        })
-        .collect();
-    if todo.is_empty() {
-        return Ok((0, 0, 0, 0.0));
+            tx.commit().map_err(|e| e.to_string())?;
+            gone = stale.len();
+        }
     }
 
-    let t0 = Instant::now();
+    // sid is assigned here, in sorted path order, not by whichever thread
+    // finished first: it is the ev primary key and appears in every `alog sql`
+    // result, and a nondeterministic one made 99.9% of sessions change id
+    // between two builds of the same files.
+    let mut todo: Vec<(PathBuf, Option<store::Prev>, i64)> = Vec::new();
+    {
+        let tx = con.transaction().map_err(|e| e.to_string())?;
+        for (p, key) in paths.into_iter().zip(keys) {
+            let prev = known.remove(&key);
+            match prev {
+                // Every known file is handed to the scanner, which decides
+                // whether to resume by re-hashing the record at the cursor. No
+                // metadata shortcut stands in front of that: size and mtime are
+                // both restorable, and a file that restores them is skipped.
+                Some(pv) => {
+                    let sid = pv.sid;
+                    todo.push((p, Some(pv), sid))
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO run (ext, path) VALUES (?1, ?2)",
+                        rusqlite::params![store::ext_id(&p, &root), key],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let sid = tx.last_insert_rowid();
+                    todo.push((p, None, sid));
+                }
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    if todo.is_empty() {
+        return Ok((0, 0, 0, gone, t0.elapsed().as_secs_f64()));
+    }
+
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::sync_channel::<store::Scanned>(threads * 4);
-    let rootc = root.clone();
     pool.spawn(move || {
         todo.into_par_iter()
-            .for_each_with(tx, |tx, (p, sid, cursor, base)| {
-                if let Ok(s) = store::scan_file(&p, &rootc, cursor, sid, base) {
+            .for_each_with(tx, |tx, (p, prev, sid)| {
+                if let Ok(s) = store::scan_file(&p, prev.as_ref(), sid) {
                     let _ = tx.send(s);
                 }
             });
@@ -393,9 +486,7 @@ fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, usize, 
                 *bare += s
                     .rows
                     .iter()
-                    .filter(|r| {
-                        r.role.is_none() && r.tool.is_none() && r.text.is_empty()
-                    })
+                    .filter(|r| r.role.is_none() && r.tool.is_none() && r.text.is_empty())
                     .count();
             }
         }
@@ -410,16 +501,20 @@ fn sync(db: &Path, root: &Path, threads: usize) -> Result<(usize, usize, usize, 
         }
     }
     flush(&mut batch, &mut con, &mut files, &mut records, &mut bare)?;
-    Ok((files, records, bare, t0.elapsed().as_secs_f64()))
+    Ok((files, records, bare, gone, t0.elapsed().as_secs_f64()))
 }
 
 fn dump(con: &rusqlite::Connection, session: Option<&str>) -> Result<(), String> {
     use std::io::Write;
     let sql = match session {
-        Some(_) => "SELECT e.sid, e.seq FROM ev e JOIN run r USING (sid)
-                    WHERE r.ext = ?1 ORDER BY e.seq",
-        None => "SELECT e.sid, e.seq FROM ev e JOIN run r USING (sid)
-                 ORDER BY r.ext, e.seq",
+        Some(_) => {
+            "SELECT e.sid, e.seq FROM ev e JOIN run r USING (sid)
+                    WHERE r.ext = ?1 ORDER BY e.seq"
+        }
+        None => {
+            "SELECT e.sid, e.seq FROM ev e JOIN run r USING (sid)
+                 ORDER BY r.ext, e.seq"
+        }
     };
     let mut st = con.prepare(sql).map_err(|e| e.to_string())?;
     let rows: Vec<(i64, i64)> = match session {
@@ -436,14 +531,28 @@ fn dump(con: &rusqlite::Connection, session: Option<&str>) -> Result<(), String>
     };
     let out = std::io::stdout();
     let mut w = std::io::BufWriter::new(out.lock());
+    // A skip is a failure, not a warning. Exiting 0 after writing 0 bytes told
+    // a caller the dump succeeded and the session was empty.
+    let mut skipped = 0usize;
+    let mut first = String::new();
     for (sid, seq) in rows {
         match store::read_record(con, sid, seq) {
             Ok(raw) => {
-                w.write_all(extract::strip_py(&raw)).map_err(|e| e.to_string())?;
+                w.write_all(extract::strip_ws(&raw))
+                    .map_err(|e| e.to_string())?;
                 w.write_all(b"\n").map_err(|e| e.to_string())?;
             }
-            Err(e) => eprintln!("alog: skipped {sid}/{seq}: {e}"),
+            Err(e) => {
+                if skipped == 0 {
+                    first = e;
+                }
+                skipped += 1;
+            }
         }
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    if skipped > 0 {
+        return Err(format!("{skipped} records unreadable; first: {first}"));
     }
     Ok(())
 }

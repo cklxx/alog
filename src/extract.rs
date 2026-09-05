@@ -1,5 +1,4 @@
-// alog scan+extract core. Byte-compatible with alog/extract.py claude_code().
-// No SQLite. No threads here; the caller owns parallelism.
+// Scan and extract. No SQLite, no threads: the caller owns parallelism.
 
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -9,21 +8,17 @@ use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 
-/// Shared with Python. A record whose bracket nesting exceeds this is a reject
-/// on BOTH sides, so the two parsers' own limits (serde_json 128, orjson ~510,
-/// CPython json ~600) never decide the outcome.
+/// Reject deeper nesting ourselves, so serde_json's own limit of 128 never
+/// decides which records make it in.
 pub const MAX_DEPTH: usize = 100;
 pub const MAX_LINE: usize = 32 << 20;
-/// Python slices `command[:200]` in CHARACTERS.
+/// Characters, not bytes.
 pub const CMD_CHARS: usize = 200;
 
-// ---------------------------------------------------------------- strip
-
-/// Exactly CPython `bytes.strip()`: {0x09,0x0a,0x0b,0x0c,0x0d,0x20}.
-/// `u8::is_ascii_whitespace` omits 0x0b (vertical tab) and would change both
-/// `len` and `rec_hash` on any line wrapped in it.
+/// {0x09,0x0a,0x0b,0x0c,0x0d,0x20}. `u8::is_ascii_whitespace` omits 0x0b, which
+/// would change both `len` and `rec_hash` on any line wrapped in it.
 #[inline]
-pub fn strip_py(b: &[u8]) -> &[u8] {
+pub fn strip_ws(b: &[u8]) -> &[u8] {
     #[inline(always)]
     fn ws(c: u8) -> bool {
         matches!(c, b' ' | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d)
@@ -39,7 +34,8 @@ pub fn strip_py(b: &[u8]) -> &[u8] {
     &b[s..e]
 }
 
-/// crc32(stripped) | (len(stripped) << 32), matching index.py `_rec_hash`.
+/// crc32(stripped) | (len(stripped) << 32). The length guard catches a
+/// same-length edit that crc32 alone would collide on.
 #[inline]
 pub fn rec_hash(b: &[u8]) -> i64 {
     let c = crc32fast::hash(b) as u64;
@@ -86,12 +82,9 @@ pub fn max_depth(b: &[u8]) -> usize {
     mx
 }
 
-// ------------------------------------------------- presence-preserving field
-
-/// Distinguishes an absent key from an explicit `null`. Needed ONLY for
-/// `is_error`, which Python tests with `"is_error" in b` (membership), not with
-/// `.get()`. Every other field uses `.get()`, where absent and null are
-/// indistinguishable, so those map null -> Absent.
+/// Distinguishes an absent key from an explicit `null`. Needed only for
+/// `is_error`, where the two mean different things: absent is "not a tool
+/// result", null is "a tool result that did not fail".
 #[derive(Debug, Clone, Default)]
 pub enum Present {
     #[default]
@@ -129,21 +122,17 @@ impl<'de: 'a, 'a> Deserialize<'de> for Key<'a> {
     }
 }
 
-/// Hand-written object deserializers. `#[derive(Deserialize)]` is WRONG here on
-/// two counts, both silent and both invisible to the corpus:
-///   1. it ERRORS on a duplicate key ("duplicate field `cwd`") where CPython
-///      dict takes last-wins, rejecting a whole record Python indexes;
-///   2. it accepts a struct built FROM A JSON ARRAY by field position, so
-///      `[1,2,3]` became a row with a fabricated ts=1000 where Python rejects
-///      `not_an_object`.
-/// `strict` accepts only a map (used for the top-level record). `lenient`
-/// returns Default for any non-map, mirroring `x if isinstance(x, dict) else {}`.
+/// `#[derive(Deserialize)]` is wrong here on two counts, both silent: it errors
+/// on a duplicate key where last-wins is correct, and it builds a struct from a
+/// JSON ARRAY by field position, so `[1,2,3]` becomes a row with a fabricated
+/// timestamp instead of a `not_an_object` reject.
+/// `strict` accepts only a map; `lenient` returns Default for any non-map.
 macro_rules! obj_de {
     (@body $name:ident $(<$lt:lifetime>)?, $a:ident, [$($key:literal => $f:ident : $fty:ty),* $(,)?]) => {{
         let mut out = $name::default();
         while let Some(k) = $a.next_key::<Key>()? {
             match k.0.as_ref() {
-                // Last write wins, in place: CPython dict and IndexMap agree.
+                // Last write wins, in place.
                 $($key => out.$f = $a.next_value::<$fty>()?,)*
                 _ => { $a.next_value::<IgnoredAny>()?; }
             }
@@ -231,8 +220,8 @@ macro_rules! obj_de {
     };
 }
 
-/// A field Python reads with `isinstance(v, str)`: anything else behaves as
-/// absent for the value, but is still "present" for control flow.
+/// A string field where a non-string reads as absent for the value but still
+/// counts as present.
 #[derive(Debug, Clone, Default)]
 pub enum MaybeStr<'a> {
     #[default]
@@ -271,7 +260,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for MaybeStr<'a> {
             fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
                 Ok(MaybeStr::Str(Cow::Owned(v)))
             }
-            // `null` == absent: Python reads every one of these with .get().
+            // null is absent: nothing distinguishes them for these fields.
             fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
                 Ok(MaybeStr::Absent)
             }
@@ -306,7 +295,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for MaybeStr<'a> {
     }
 }
 
-/// A field Python reads with `isinstance(v, dict) else {}`.
+/// An object field where a non-object reads as empty.
 fn de_map_or_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -353,11 +342,8 @@ where
     d.deserialize_any(V(PhantomData))
 }
 
-// ------------------------------------------------------------------ ints
-
-/// `_int(v) = v if isinstance(v, int) else None`, plus an i64 range clamp.
-/// bool IS int in Python, so `true` -> 1. Out-of-i64 -> NULL on both sides
-/// (see the Python patch: v0 crashed SQLite instead).
+/// An integer field, clamped to i64. `true` reads as 1; anything out of range
+/// is NULL rather than a SQLite error.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IntOrNull(pub Option<i64>);
 
@@ -406,8 +392,6 @@ impl<'de> Deserialize<'de> for IntOrNull {
     }
 }
 
-// ------------------------------------------------------------- timestamps
-
 #[derive(Debug, Clone, Default)]
 pub enum TsVal<'a> {
     #[default]
@@ -426,7 +410,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for TsVal<'a> {
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("any JSON value")
             }
-            // Python: isinstance(True, int) -> parse_ts(True) == 1000.
+            // `true` is 1, so it lands one second past the epoch.
             fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
                 Ok(TsVal::Int(v as i128))
             }
@@ -467,7 +451,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for TsVal<'a> {
     }
 }
 
-/// Days from civil, Howard Hinnant. Mirrors extract.py exactly.
+/// Days from civil, Howard Hinnant.
 #[inline]
 fn days_from_civil(mut y: i64, mo: i64, d: i64) -> i64 {
     y -= (mo <= 2) as i64;
@@ -478,9 +462,7 @@ fn days_from_civil(mut y: i64, mo: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// `_TS_RE` = ^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?
-/// ASCII digits only. v0's `\d` also matched Unicode decimal digits; that is
-/// patched to `[0-9]` so this side is exact.
+/// `YYYY-MM-DD[T ]HH:MM:SS(.frac)?`, ASCII digits only.
 fn parse_ts_str(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 19 {
@@ -542,7 +524,7 @@ fn parse_ts_str(s: &str) -> Option<i64> {
     Some(ms)
 }
 
-/// Python: int/float -> int(v*1000) if v < 1e12 else int(v). Out-of-i64 -> NULL.
+/// A bare number is seconds below 1e12, milliseconds above.
 fn parse_ts(v: &TsVal) -> Option<i64> {
     match v {
         TsVal::Int(i) => {
@@ -555,7 +537,7 @@ fn parse_ts(v: &TsVal) -> Option<i64> {
             }
             let r = if *f < 1e12 { *f * 1000.0 } else { *f };
             let t = r.trunc();
-            if t >= -9.223372036854776e18 && t < 9.223372036854776e18 {
+            if (-9.223372036854776e18..9.223372036854776e18).contains(&t) {
                 Some(t as i64)
             } else {
                 None
@@ -565,8 +547,6 @@ fn parse_ts(v: &TsVal) -> Option<i64> {
         _ => None,
     }
 }
-
-// ---------------------------------------------------------------- content
 
 #[derive(Debug, Clone, Default)]
 pub enum ContentField<'a> {
@@ -602,16 +582,17 @@ obj_de!(lenient Block<'a>, [
     "is_error" => is_error: Present,
 ]);
 
-/// `input` as an ordered map. `preserve_order` makes serde_json's Map an
-/// IndexMap, so a duplicate key overwrites IN PLACE -- exactly CPython dict.
-/// A hand-rolled visitor that pushed every entry emitted BOTH values, adding
-/// searchable text for a command the record does not contain.
+/// `input` as an ordered map: `preserve_order` makes serde_json's Map an
+/// IndexMap, so a duplicate key overwrites in place. A visitor that pushed
+/// every entry emitted both values, indexing text the record never held.
 #[derive(Debug, Clone, Default)]
 pub struct InputMap(pub Option<Map<String, Value>>);
 
 impl<'de> Deserialize<'de> for InputMap {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(InputMap(Some(de_map_or_default::<D, Map<String, Value>>(d)?)))
+        Ok(InputMap(Some(de_map_or_default::<D, Map<String, Value>>(
+            d,
+        )?)))
     }
 }
 
@@ -714,8 +695,6 @@ impl<'de: 'a, 'a> Deserialize<'de> for Node<'a> {
     }
 }
 
-// ----------------------------------------------------------------- record
-
 #[derive(Debug, Clone, Default)]
 pub struct Msg<'a> {
     pub role: MaybeStr<'a>,
@@ -761,8 +740,6 @@ obj_de!(strict Rec<'a>, [
     "message" => message: Msg<'a>,
 ]);
 
-// ------------------------------------------------------------ extraction
-
 fn text_of(c: &ContentField, out: &mut Vec<String>) {
     match c {
         ContentField::Str(s) => {
@@ -784,7 +761,7 @@ fn text_of(c: &ContentField, out: &mut Vec<String>) {
                             if !t.is_empty() {
                                 out.push(t.to_string());
                             }
-                            continue; // Python `continue`s on a str `text`
+                            continue; // a bare string `text` is not a block
                         }
                         match &b.content {
                             ContentField::Str(s) => {
@@ -793,7 +770,7 @@ fn text_of(c: &ContentField, out: &mut Vec<String>) {
                                 }
                             }
                             ContentField::List(_) => {
-                                // Python appends the JOINED sub-result as ONE item.
+                                // The joined sub-result is one item, not many.
                                 let mut inner = Vec::new();
                                 text_of(&b.content, &mut inner);
                                 let j = inner.join(" ");
@@ -838,7 +815,7 @@ const TARGET_KEYS: [&str; 6] = [
     "pattern",
 ];
 
-/// Python truthiness of an arbitrary JSON value.
+/// Truthy: a non-empty string, a non-zero number, a non-empty container.
 #[inline]
 fn py_truthy(v: &Value) -> bool {
     match v {
@@ -851,15 +828,15 @@ fn py_truthy(v: &Value) -> bool {
     }
 }
 
-/// `_tool_of`. Returns Err(reason) for a shape where Python would store a
-/// NON-STRING in the TEXT column `tool` (SQLite would coerce it via TEXT
-/// affinity, e.g. 42 -> '42'). Rather than reproduce that coercion, both sides
-/// reject the record loudly. Corpus incidence measured at 0.
-pub fn tool_of(
-    c: &ContentField,
-) -> Result<(Option<String>, Option<String>, Option<i64>), &'static str> {
+/// Err(reason) when `name` is present but not a string: SQLite would coerce it
+/// through TEXT affinity (42 -> '42') and store a tool that does not exist.
+/// Reject loudly instead. Corpus incidence measured at 0.
+/// (tool, target, is_err)
+pub type ToolOf = (Option<String>, Option<String>, Option<i64>);
+
+pub fn tool_of(c: &ContentField) -> Result<ToolOf, &'static str> {
     let mut tool: Option<String> = None;
-    let mut tool_set = false; // mirrors Python's `tool is not None`
+    let mut tool_set = false;
     let mut target: Option<String> = None;
     let mut is_err: Option<i64> = None;
     let nodes = match c {
@@ -877,11 +854,9 @@ pub fn tool_of(
                     tool = Some(s.to_string());
                     tool_set = true;
                 }
-                // Python: `b.get("name")` is non-None, so `tool is None` is
-                // False for every later block, AND a non-str lands in a TEXT
-                // column. Refuse instead of guessing SQLite's coercion.
+                // A non-string name would silence every later tool_use block.
                 MaybeStr::NotStr => return Err("tool_name_not_a_string"),
-                // Absent -> Python leaves tool None, so a LATER tool_use wins.
+                // Absent leaves tool None, so a later tool_use still wins.
                 MaybeStr::Absent => {}
             }
             if let InputMap(Some(m)) = &b.input {
@@ -921,7 +896,6 @@ pub fn tool_of(
     Ok((tool, target, is_err))
 }
 
-/// One extracted row.
 #[derive(Debug, Default)]
 pub struct Row {
     pub off: i64,
@@ -961,16 +935,164 @@ pub fn claude_code(r: &Rec, off: i64, len: i64, hash: i64) -> Result<Row, &'stat
     })
 }
 
-// -------------------------------------------------------------- scanner
-
 pub struct ScanOut {
     pub rows: Vec<Row>,
     pub rejects: Vec<(i64, i64, &'static str)>,
     pub end: i64,
 }
 
-/// Framing identical to index.py `scan()`: a trailing line without \n is not
-/// consumed, blank lines advance the offset only.
+/// Codex writes `{timestamp, type, payload}` where payload.type is the real
+/// discriminator. Measured over 3,149 local session files: function_call and
+/// function_call_output dominate, then reasoning and message.
+///
+/// serde_json::Value, not a zero-copy deserializer like Rec: this path only
+/// runs for records the Claude Code extractor left empty, so its cost is paid
+/// on Codex files alone.
+pub fn codex(txt: &str, off: i64, len: i64, hash: i64) -> Option<Row> {
+    let v: Value = serde_json::from_str(txt).ok()?;
+    let outer = v.get("type")?.as_str()?;
+    let p = v.get("payload")?;
+    let pt = p.get("type").and_then(|x| x.as_str());
+    let kind = match pt {
+        Some(t) => format!("{outer}/{t}"),
+        None => outer.to_string(),
+    };
+    let mut r = Row {
+        off,
+        len,
+        hash,
+        ts: v.get("timestamp").and_then(|t| t.as_str()).and_then(iso_ms),
+        kind: Some(kind),
+        ..Default::default()
+    };
+    r.role = p.get("role").and_then(|x| x.as_str()).map(str::to_string);
+    r.tool = p.get("name").and_then(|x| x.as_str()).map(str::to_string);
+
+    let mut text = String::new();
+    match pt {
+        Some("function_call") => {
+            // arguments is a JSON string; the useful target is inside it.
+            if let Some(a) = p.get("arguments").and_then(|x| x.as_str()) {
+                r.target = serde_json::from_str::<Value>(a)
+                    .ok()
+                    .and_then(|j| {
+                        ["cmd", "command", "path", "file_path", "query"]
+                            .iter()
+                            .find_map(|k| j.get(*k).and_then(|x| x.as_str()).map(str::to_string))
+                    })
+                    .or_else(|| Some(trunc_chars(a, CMD_CHARS)));
+                text.push_str(a);
+            }
+        }
+        Some("custom_tool_call") => {
+            if let Some(i) = p.get("input").and_then(|x| x.as_str()) {
+                r.target = i.lines().next().map(|l| trunc_chars(l, CMD_CHARS));
+                text.push_str(i);
+            }
+        }
+        Some("function_call_output") | Some("custom_tool_call_output") => {
+            if let Some(o) = p.get("output").and_then(|x| x.as_str()) {
+                // "Process exited with code N" is Codex's only failure marker.
+                r.is_err = Some(match o.find("exited with code ") {
+                    Some(i) => (o[i + 17..].trim_start().as_bytes().first() != Some(&b'0')) as i64,
+                    None => 0,
+                });
+                text.push_str(o);
+            }
+        }
+        Some("message") => collect_v(p.get("content"), &mut text),
+        Some("reasoning") => collect_v(p.get("summary"), &mut text),
+        Some("user_message") | Some("agent_message") => {
+            if let Some(m) = p.get("message").and_then(|x| x.as_str()) {
+                text.push_str(m);
+            }
+        }
+        Some("agent_reasoning") => {
+            if let Some(m) = p.get("text").and_then(|x| x.as_str()) {
+                text.push_str(m);
+            }
+        }
+        Some("token_count") => {
+            // last_token_usage is this call's usage; total_token_usage is the
+            // running session total and would sum to a quadratic overcount.
+            if let Some(u) = p.get("info").and_then(|i| i.get("last_token_usage")) {
+                let g = |k: &str| u.get(k).and_then(|x| x.as_i64());
+                r.in_tok = g("input_tokens");
+                r.out_tok = g("output_tokens");
+                r.cache_r = g("cached_input_tokens");
+            }
+        }
+        _ => {
+            // session_meta and turn_context: name the session, not the content.
+            if let Some(c) = p.get("cwd").and_then(|x| x.as_str()) {
+                r.target = Some(c.to_string());
+            }
+        }
+    }
+    r.text = text;
+    Some(r)
+}
+
+/// `text` and `input_text` blocks, at any nesting depth.
+fn collect_v(v: Option<&Value>, out: &mut String) {
+    match v {
+        Some(Value::String(s)) => {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(s);
+        }
+        Some(Value::Array(a)) => a.iter().for_each(|x| collect_v(Some(x), out)),
+        Some(Value::Object(m)) => {
+            for k in ["text", "content", "summary"] {
+                if let Some(x) = m.get(k) {
+                    collect_v(Some(x), out);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `2026-03-09T05:10:50.882Z` to epoch ms. Codex always writes RFC 3339 UTC.
+fn iso_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let num = |a: usize, z: usize| s.get(a..z)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let ms = if b.len() > 20 && b[19] == b'.' {
+        s.get(20..23)
+            .and_then(|f| f.parse::<i64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    // days_from_civil, Howard Hinnant's algorithm.
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(((days * 86400 + h * 3600 + mi * 60 + sec) * 1000) + ms)
+}
+
+fn trunc_chars(s: &str, n: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= n {
+        flat
+    } else {
+        flat.chars().take(n).collect()
+    }
+}
+
+/// A trailing line without \n is not consumed; blank lines advance the offset
+/// only.
 pub fn scan_buf(buf: &[u8], start: i64) -> ScanOut {
     let mut rows = Vec::new();
     let mut rejects: Vec<(i64, i64, &'static str)> = Vec::new();
@@ -983,20 +1105,20 @@ pub fn scan_buf(buf: &[u8], start: i64) -> ScanOut {
         };
         let line = &buf[pos..=nl];
         let n = line.len() as i64;
-        let s = strip_py(line);
+        let s = strip_ws(line);
         if !s.is_empty() {
             if n as usize > MAX_LINE {
                 rejects.push((off, n, "record_too_large"));
             } else if bracket_count(s) > MAX_DEPTH && max_depth(s) > MAX_DEPTH {
-                // Same two-step bound as the Python side: a memchr-class count
-                // first, the exact scan only when it can possibly exceed.
+                // Two-step: a memchr count first, the exact scan only when
+                // it can possibly exceed.
                 rejects.push((off, n, "depth_limit"));
             } else {
                 match std::str::from_utf8(s) {
                     Err(_) => rejects.push((off, n, "invalid_utf8")),
                     Ok(txt) => match serde_json::from_str::<Rec>(txt) {
                         Err(_) => {
-                            // Distinguish "not an object" the way Python does.
+                            // Name the shape, so a reject says why.
                             match serde_json::from_str::<serde_json::Value>(txt) {
                                 Ok(Value::Object(_)) => rejects.push((off, n, "parse_error")),
                                 Ok(_) => rejects.push((off, n, "not_an_object")),
@@ -1004,6 +1126,17 @@ pub fn scan_buf(buf: &[u8], start: i64) -> ScanOut {
                             }
                         }
                         Ok(rec) => match claude_code(&rec, off, n, rec_hash(s)) {
+                            // A Codex record is a valid Rec, just a hollow one:
+                            // `type` reads, but the content lives under
+                            // `payload`, not `message`. Retry rather than store
+                            // a row whose every other column is NULL.
+                            Ok(row)
+                                if row.text.is_empty()
+                                    && row.role.is_none()
+                                    && row.tool.is_none() =>
+                            {
+                                rows.push(codex(txt, off, n, rec_hash(s)).unwrap_or(row))
+                            }
                             Ok(row) => rows.push(row),
                             Err(why) => rejects.push((off, n, why)),
                         },

@@ -7,9 +7,36 @@ use crate::store::{open_ro, read_record};
 
 const VIEWER: &str = include_str!("viewer.html");
 
+type Opt = Option<String>;
+type OptN = Option<i64>;
+/// (first_seq, t0, t1, records, tools, errors, calls, in, out, cache)
+type TurnRow = (i64, OptN, OptN, i64, i64, OptN, i64, i64, i64, i64);
+/// (seq, ts, kind, role, model, tool, target, is_err, len, in, out, cache)
+type EvRow = (
+    i64,
+    OptN,
+    Opt,
+    Opt,
+    Opt,
+    Opt,
+    Opt,
+    OptN,
+    i64,
+    OptN,
+    OptN,
+    OptN,
+);
+/// (ext, sid, seq, ts, kind, tool, target, is_err)
+type HitRow = (String, i64, i64, OptN, Opt, Opt, Opt, OptN);
+/// (ext, sid, seq, ts, tool, target)
+type ErrRow = (String, i64, i64, OptN, Opt, Opt);
+
 pub fn run(db: &Path, port: u16) -> Result<(), String> {
     if !db.exists() {
-        return Err(format!("no index at {}; run `alog sync <dir>`", db.display()));
+        return Err(format!(
+            "no index at {}; run `alog sync <dir>`",
+            db.display()
+        ));
     }
     let addr = format!("127.0.0.1:{port}");
     let server = Server::http(&addr).map_err(|e| e.to_string())?;
@@ -222,11 +249,23 @@ fn sessions(con: &Connection, limit: i64) -> Result<String, String> {
 /// thinks in -- what was asked, what it took -- instead of a flat event list.
 /// Claude Code writes no turn marker; see query::TURNS for how it is derived.
 fn turns(con: &Connection, sid: i64) -> Result<String, String> {
-    let mut st = con.prepare(crate::query::TURNS).map_err(|e| e.to_string())?;
-    let raw: Vec<(i64, Option<i64>, Option<i64>, i64, i64, Option<i64>, i64, i64, i64, i64)> = st
+    let mut st = con
+        .prepare(crate::query::TURNS)
+        .map_err(|e| e.to_string())?;
+    let raw: Vec<TurnRow> = st
         .query_map(params![sid], |r| {
-            Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-                r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?))
+            Ok((
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+            ))
         })
         .map_err(|e| e.to_string())?
         .flatten()
@@ -237,7 +276,9 @@ fn turns(con: &Connection, sid: i64) -> Result<String, String> {
             format!(
                 "{{\"seq\":{s0},\"t0\":{},\"t1\":{},\"n\":{n},\"calls\":{calls},\
                   \"tools\":{tools},\"err\":{},\"in\":{i},\"out\":{o},\"cache\":{c},\"ask\":{}}}",
-                jnum(*t0), jnum(*t1), err.unwrap_or(0),
+                jnum(*t0),
+                jnum(*t1),
+                err.unwrap_or(0),
                 jstr(&preview(con, sid, *s0, 160))
             )
         })
@@ -255,13 +296,21 @@ fn timeline(con: &Connection, sid: i64, start: i64, limit: i64) -> Result<String
              WHERE sid = ?1 AND seq >= ?2 AND {KEEP} ORDER BY seq LIMIT ?3"
         ))
         .map_err(|e| e.to_string())?;
-    let raw: Vec<(i64, Option<i64>, Option<String>, Option<String>, Option<String>,
-                  Option<String>, Option<String>, Option<i64>, i64,
-                  Option<i64>, Option<i64>, Option<i64>)> = st
+    let raw: Vec<EvRow> = st
         .query_map(params![sid, start, limit], |r| {
             Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-                r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
             ))
         })
         .map_err(|e| e.to_string())?
@@ -278,26 +327,28 @@ fn timeline(con: &Connection, sid: i64, start: i64, limit: i64) -> Result<String
         )
         .map_err(|e| e.to_string())?;
 
-    let rows: Vec<String> = raw
-        .iter()
-        .map(|(seq, ts, kind, role, model, tool, target, err, len, i, o, c)| {
-            // Read the source only when the indexed columns leave the row blank:
-            // 37% of rows measured as a bare role, and TaskCreate/Agent/ToolSearch
-            // carry their whole payload in an input object with no path-like target.
-            let text = if target.is_none() || *err == Some(1) {
-                preview(con, sid, *seq, 180)
-            } else {
-                String::new()
-            };
-            format!(
+    let rows: Vec<String> =
+        raw.iter()
+            .map(
+                |(seq, ts, kind, role, model, tool, target, err, len, i, o, c)| {
+                    // Read the source only when the indexed columns leave the row blank:
+                    // 37% of rows measured as a bare role, and TaskCreate/Agent/ToolSearch
+                    // carry their whole payload in an input object with no path-like target.
+                    let text = if target.is_none() || *err == Some(1) {
+                        preview(con, sid, *seq, 180)
+                    } else {
+                        String::new()
+                    };
+                    format!(
                 "{{\"seq\":{seq},\"ts\":{},\"kind\":{},\"role\":{},\"model\":{},\"tool\":{},\
                   \"target\":{},\"err\":{},\"len\":{len},\"in\":{},\"out\":{},\"cache\":{},\
                   \"text\":{}}}",
                 jnum(*ts), jopt(kind), jopt(role), jopt(model), jopt(tool), jopt(target),
                 jnum(*err), jnum(*i), jnum(*o), jnum(*c), jstr(&text)
             )
-        })
-        .collect();
+                },
+            )
+            .collect();
     Ok(format!(
         "{{\"n_ev\":{n_ev},\"n_shown\":{shown},\"hidden\":{},\"rows\":[{}]}}",
         n_ev - shown,
@@ -335,17 +386,21 @@ fn search(con: &Connection, term: &str, limit: i64) -> Result<String, String> {
         Ok(s) => s,
         Err(e) => return Ok(err_json(&e.to_string())),
     };
-    let rows: Vec<(String, i64, i64, Option<i64>, Option<String>, Option<String>,
-                   Option<String>, Option<i64>)> =
-        match st.query_map(params![term, limit], |r| {
-            Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-                r.get(7)?,
-            ))
-        }) {
-            Ok(it) => it.flatten().collect(),
-            Err(e) => return Ok(err_json(&e.to_string())),
-        };
+    let rows: Vec<HitRow> = match st.query_map(params![term, limit], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+            r.get(7)?,
+        ))
+    }) {
+        Ok(it) => it.flatten().collect(),
+        Err(e) => return Ok(err_json(&e.to_string())),
+    };
     let words = terms_of(term);
     let hits: Vec<String> = rows
         .iter()
@@ -356,7 +411,13 @@ fn search(con: &Connection, term: &str, limit: i64) -> Result<String, String> {
             format!(
                 "{{\"ext\":{},\"sid\":{sid},\"seq\":{seq},\"ts\":{},\"kind\":{},\"tool\":{},\
                   \"target\":{},\"err\":{},\"snip\":{}}}",
-                jstr(ext), jnum(*ts), jopt(kind), jopt(tool), jopt(target), jnum(*err), jstr(&s)
+                jstr(ext),
+                jnum(*ts),
+                jopt(kind),
+                jopt(tool),
+                jopt(target),
+                jnum(*err),
+                jstr(&s)
             )
         })
         .collect();
@@ -377,9 +438,16 @@ fn errors(con: &Connection, limit: i64) -> Result<String, String> {
              WHERE e.is_err = 1 ORDER BY e.ts DESC LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, i64, i64, Option<i64>, Option<String>, Option<String>)> = st
+    let rows: Vec<ErrRow> = st
         .query_map(params![limit], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })
         .map_err(|e| e.to_string())?
         .flatten()
@@ -391,7 +459,11 @@ fn errors(con: &Connection, limit: i64) -> Result<String, String> {
             format!(
                 "{{\"ext\":{},\"sid\":{sid},\"seq\":{seq},\"ts\":{},\"tool\":{},\
                   \"target\":{},\"snip\":{}}}",
-                jstr(ext), jnum(*ts), jopt(tool), jopt(target), jstr(&s)
+                jstr(ext),
+                jnum(*ts),
+                jopt(tool),
+                jopt(target),
+                jstr(&s)
             )
         })
         .collect();
