@@ -211,9 +211,32 @@ pub fn search(con: &Connection, term: &str, limit: usize, snippets: bool) -> Str
     };
     let more = hits.len() > limit;
     let hits = &hits[..hits.len().min(limit)];
-    let mut out = format!("hits={} elapsed={}ms", hits.len(), t0.elapsed().as_millis());
+    // The total, not just the fact of truncation: "20 of 4184" tells a reader
+    // whether to narrow the query, where "TRUNCATED" only says something was
+    // hidden. Costs one more fts5 count -- measured 0.03 ms on a term with 294
+    // hits and 6.5 ms on one with 392,758, against a ~50 ms process floor.
+    let total: i64 = if more {
+        con.query_row(
+            "SELECT count(*) FROM ftx WHERE ftx MATCH ?1",
+            rusqlite::params![term],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    } else {
+        hits.len() as i64
+    };
+    let mut out = if more && total > 0 {
+        format!("hits={} of {total}", hits.len())
+    } else {
+        format!("hits={}", hits.len())
+    };
+    let _ = write!(out, " elapsed={}ms", t0.elapsed().as_millis());
     if more {
-        let _ = write!(out, " TRUNCATED at limit={limit}");
+        let _ = if total > 0 {
+            write!(out, " -- narrow the query or raise --limit")
+        } else {
+            write!(out, " TRUNCATED at limit={limit}")
+        };
     }
     if hits.is_empty() {
         out.push_str("\nno matches; try a shorter term or pre*");
@@ -692,4 +715,183 @@ fn collect_text(v: &serde_json::Value, out: &mut String) {
         }
         _ => {}
     }
+}
+
+/// Verify the index against the files it was built from, and say what is wrong
+/// in a form both a person and an agent can act on.
+///
+/// `PRAGMA integrity_check` is not this check and cannot replace it: it returns
+/// `ok` on an index whose every row answers for text that is no longer on disk,
+/// because SQLite's pages are perfectly consistent -- they just describe a file
+/// that changed. So this reads sources: it re-hashes a sample of records through
+/// the same `rec_hash` the writer used, and stats every indexed path.
+///
+/// `sample` records are checked per session, newest sessions first. 0 means all.
+pub fn doctor(con: &Connection, sample: usize, json: bool) -> (bool, String) {
+    let t0 = std::time::Instant::now();
+    let mut problems: Vec<(String, String, String)> = Vec::new(); // kind, what, hint
+
+    let (evn, runs, rej): (i64, i64, i64) = con
+        .query_row(
+            "SELECT (SELECT count(*) FROM ev), (SELECT count(*) FROM run),
+                    (SELECT count(*) FROM reject)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap_or((0, 0, 0));
+
+    let ok: String = con
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap_or_else(|e| e.to_string());
+    if ok != "ok" {
+        problems.push((
+            "corrupt-index".into(),
+            format!("integrity_check: {ok}"),
+            "rebuild: delete the index and run `alog sync`".into(),
+        ));
+    }
+
+    // A run row whose file is gone keeps answering searches and keeps skewing
+    // the corpus-global bm25 IDF every other session's ranking depends on.
+    let paths: Vec<(i64, String, String)> =
+        match con.prepare("SELECT sid, ext, path FROM run ORDER BY sid") {
+            Ok(mut st) => st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+    let mut gone: std::collections::HashSet<i64> = Default::default();
+    let mut missing = 0usize;
+    for (sid, ext, path) in &paths {
+        if !std::path::Path::new(path).exists() {
+            missing += 1;
+            gone.insert(*sid);
+            if missing <= 5 {
+                problems.push((
+                    "file-gone".into(),
+                    format!("{ext}: {path}"),
+                    "run `alog sync` to drop it".into(),
+                ));
+            }
+        }
+    }
+    if missing > 5 {
+        problems.push((
+            "file-gone".into(),
+            format!("and {} more", missing - 5),
+            "run `alog sync` to drop them".into(),
+        ));
+    }
+
+    // The real check: do the bytes on disk still hash to what was stored?
+    let mut checked = 0usize;
+    let mut stale = 0usize;
+    for (sid, ext, _) in &paths {
+        if gone.contains(sid) {
+            continue; // already reported as file-gone
+        }
+        let sql = if sample == 0 {
+            "SELECT seq FROM ev WHERE sid=?1 ORDER BY seq".to_string()
+        } else {
+            format!("SELECT seq FROM ev WHERE sid=?1 ORDER BY seq DESC LIMIT {sample}")
+        };
+        let seqs: Vec<i64> = match con.prepare(&sql) {
+            Ok(mut st) => st
+                .query_map(rusqlite::params![sid], |r| r.get(0))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        for seq in seqs {
+            checked += 1;
+            if let Err(e) = read_record(con, *sid, seq) {
+                stale += 1;
+                if stale <= 5 {
+                    problems.push((
+                        "stale-record".into(),
+                        format!("{ext} seq={seq}: {e}"),
+                        "run `alog sync` to reindex the file".into(),
+                    ));
+                }
+            }
+        }
+    }
+    if stale > 5 {
+        problems.push((
+            "stale-record".into(),
+            format!("and {} more", stale - 5),
+            "run `alog sync`".into(),
+        ));
+    }
+
+    // fts5 holds one document per record with text. A count far below the
+    // number of text-bearing rows means documents were lost.
+    let (docs, mapped): (i64, i64) = con
+        .query_row(
+            "SELECT (SELECT count(*) FROM ftx), (SELECT count(*) FROM ftx_map)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    if docs != mapped {
+        problems.push((
+            "fts-desync".into(),
+            format!("{docs} documents but {mapped} map rows"),
+            "rebuild: delete the index and run `alog sync`".into(),
+        ));
+    }
+    let orphans: i64 = con
+        .query_row(
+            "SELECT count(*) FROM ftx_map m
+             WHERE NOT EXISTS (SELECT 1 FROM ev e WHERE e.sid=m.sid AND e.seq=m.seq)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if orphans > 0 {
+        problems.push((
+            "fts-orphan".into(),
+            format!("{orphans} documents point at rows that are gone"),
+            "rebuild: delete the index and run `alog sync`".into(),
+        ));
+    }
+
+    let el = t0.elapsed().as_millis();
+    if json {
+        let mut out = format!(
+            "{{\"ok\":{},\"sessions\":{runs},\"records\":{evn},\"rejects\":{rej},\
+             \"checked\":{checked},\"stale\":{stale},\"missing_files\":{missing},\
+             \"elapsed_ms\":{el},\"problems\":[",
+            problems.is_empty()
+        );
+        for (i, (kind, what, hint)) in problems.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{{\"kind\":{kind:?},\"what\":{what:?},\"hint\":{hint:?}}}"
+            );
+        }
+        out.push_str("]}");
+        return (problems.is_empty(), out);
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "sessions {runs}  records {evn}  rejects {rej}\nverified {checked} records against their \
+         source files in {el}ms"
+    );
+    if problems.is_empty() {
+        out.push_str("ok");
+        return (true, out);
+    } else {
+        let _ = writeln!(out, "\n{} problem(s):", problems.len());
+        for (kind, what, hint) in &problems {
+            let _ = writeln!(out, "  [{kind}] {what}\n      -> {hint}");
+        }
+    }
+    (false, out)
 }

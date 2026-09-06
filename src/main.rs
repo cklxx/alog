@@ -23,30 +23,106 @@ USAGE
   alog dump [<session>]         byte-identical jsonl to stdout
   alog index <col>              build a secondary index: kind tool target ts err
   alog snapshot <out.db>        consistent copy (VACUUM INTO, never cp)
+  alog doctor [all]             verify the index against the files
   alog stats                    ingest and size numbers
 
 OPTIONS
   --db <path>     index location (default ~/.alog/index.db, or $ALOG_DB)
   --limit <n>     max rows (default 50; search 20)
   --port <n>      viewer port (default 8877)
+  --json          machine-readable output, and errors as {error:{kind,hint,...}}
   --no-snippets   skip source reads in search results
   -j <n>          scan threads (default: cores)
 ";
 
+/// stdout that dies quietly when the reader goes away. Rust ignores SIGPIPE so
+/// an EPIPE surfaces as an error, and `println!` turns that into a panic -- so
+/// `alog search ... | head` printed a panic instead of exiting. Every command
+/// writes through these.
+macro_rules! pln {
+    ($($a:tt)*) => {{
+        use std::io::Write;
+        if writeln!(std::io::stdout(), $($a)*).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
+macro_rules! pr {
+    ($($a:tt)*) => {{
+        use std::io::Write;
+        if write!(std::io::stdout(), $($a)*).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") || args.is_empty() {
-        print!("{USAGE}");
+        pr!("{USAGE}");
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("alog {}", env!("CARGO_PKG_VERSION"));
+        pln!("alog {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    let json = args.iter().any(|a| a == "--json");
     if let Err(e) = run(&args) {
-        eprintln!("alog: {e}");
+        if json {
+            // Same envelope the MCP server returns, so an agent branches on
+            // `kind` either way. stderr, so it never mixes with result data.
+            eprintln!("{}", fail(&e));
+        } else {
+            eprintln!("alog: {e}");
+        }
         std::process::exit(1);
     }
+}
+
+/// Classify a top-level failure for a machine reader: `kind` is the stable
+/// string to branch on, `hint` says what to do, `retryable` says whether doing
+/// the same thing again could work. Errors that already carry an ALOG_ code
+/// from query.rs pass through untouched.
+fn fail(e: &str) -> String {
+    let (kind, hint, retryable) = if e.starts_with("no index at") {
+        ("no-index", "run `alog sync` to build it", false)
+    } else if e.contains("no session directory found") {
+        ("no-session-directory", "pass a directory explicitly", false)
+    } else if e.starts_with("no session") {
+        (
+            "unknown-session",
+            "list sessions with `alog sql \"SELECT ext FROM run\"`",
+            false,
+        )
+    } else if e.contains("no .jsonl files under") {
+        (
+            "empty-directory",
+            "point at a directory containing .jsonl sessions",
+            false,
+        )
+    } else if e.contains("No such file or directory") {
+        ("no-such-path", "check the path exists", false)
+    } else if e.contains("records unreadable") {
+        (
+            "stale-index",
+            "the source changed on disk; run `alog sync`",
+            true,
+        )
+    } else if e.starts_with("unknown command") || e.starts_with("no command") {
+        ("bad-usage", "see `alog --help`", false)
+    } else if e.ends_with("exists") {
+        ("output-exists", "choose a path that does not exist", false)
+    } else if e.contains("database is locked") || e.contains("busy") {
+        ("locked", "another writer holds the index; retry", true)
+    } else {
+        ("error", "", false)
+    };
+    let first = e.lines().next().unwrap_or(e);
+    format!(
+        "{{\"error\":{{\"kind\":{:?},\"message\":{:?},\"hint\":{:?},\"retryable\":{}}}}}",
+        kind, first, hint, retryable
+    )
 }
 
 struct Opts {
@@ -54,6 +130,7 @@ struct Opts {
     limit: usize,
     port: u16,
     snippets: bool,
+    json: bool,
     threads: usize,
     rest: Vec<String>,
 }
@@ -73,6 +150,7 @@ fn parse(args: &[String]) -> Opts {
         limit: 0,
         port: 8877,
         snippets: true,
+        json: false,
         threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         rest: Vec::new(),
     };
@@ -89,6 +167,7 @@ fn parse(args: &[String]) -> Opts {
             "--port" => o.port = val().parse().unwrap_or(8877),
             "-j" => o.threads = val().parse().unwrap_or(o.threads).max(1),
             "--no-snippets" => o.snippets = false,
+            "--json" => o.json = true,
             _ => o.rest.push(a.to_string()),
         }
         i += 1;
@@ -144,14 +223,14 @@ fn run(args: &[String]) -> Result<(), String> {
         "sync" => {
             for d in roots(&o.rest)? {
                 let (files, records, bare, gone, el) = sync(&o.db, &d, o.threads)?;
-                println!(
+                pln!(
                     "{records} records from {files} files in {:.1}s ({:.0} rec/s)  {}",
                     el,
                     records as f64 / el.max(0.001),
                     d.display()
                 );
                 if gone > 0 {
-                    println!("dropped {gone} sessions whose files are gone");
+                    pln!("dropped {gone} sessions whose files are gone");
                 }
                 // An unknown format parses as valid JSON, stores, and dumps
                 // -- with every semantic column NULL and nothing searchable.
@@ -170,7 +249,7 @@ fn run(args: &[String]) -> Result<(), String> {
             for d in roots(&o.rest)? {
                 if let Ok((_, records, _, _, el)) = sync(&o.db, &d, o.threads) {
                     if records > 0 {
-                        println!("indexed {records} records in {el:.1}s  {}", d.display());
+                        pln!("indexed {records} records in {el:.1}s  {}", d.display());
                     }
                 }
             }
@@ -183,7 +262,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err("search needs a query".into());
             }
             let n = if o.limit == 0 { 20 } else { o.limit };
-            println!("{}", query::search(&con, &q, n, o.snippets));
+            pln!("{}", query::search(&con, &q, n, o.snippets));
         }
         "show" => {
             let con = ro(&o.db)?;
@@ -199,9 +278,9 @@ fn run(args: &[String]) -> Result<(), String> {
                         .map_err(|_| format!("no session {ext}"))?;
                     let seq: i64 = seq.parse().map_err(|_| "seq must be a number")?;
                     let raw = store::read_record(&con, sid, seq)?;
-                    print!("{}", String::from_utf8_lossy(&raw));
+                    pr!("{}", String::from_utf8_lossy(&raw));
                 }
-                None => println!(
+                None => pln!(
                     "{}",
                     query::outline(&con, ext, 0, if o.limit == 0 { 80 } else { o.limit })
                 ),
@@ -210,7 +289,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "turns" => {
             let con = ro(&o.db)?;
             let ext = o.rest.first().ok_or("turns needs a session")?;
-            println!(
+            pln!(
                 "{}",
                 query::turns(&con, ext, if o.limit == 0 { 60 } else { o.limit })
             );
@@ -218,19 +297,19 @@ fn run(args: &[String]) -> Result<(), String> {
         "sql" => {
             let con = ro(&o.db)?;
             let q = o.rest.join(" ");
-            println!(
+            pln!(
                 "{}",
                 query::query(&con, &q, if o.limit == 0 { 50 } else { o.limit })
             );
         }
         "catalog" => {
             let con = ro(&o.db)?;
-            print!("{}", query::catalog(&con).map_err(|e| e.to_string())?);
+            pr!("{}", query::catalog(&con).map_err(|e| e.to_string())?);
         }
         "errors" => {
             let con = ro(&o.db)?;
             let n = if o.limit == 0 { 50 } else { o.limit };
-            println!(
+            pln!(
                 "{}",
                 query::query(
                     &con,
@@ -275,7 +354,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let con = store::open(&o.db).map_err(|e| e.to_string())?;
             let t = Instant::now();
             con.execute_batch(sql).map_err(|e| e.to_string())?;
-            println!("built ix_{name} in {:.1}s", t.elapsed().as_secs_f64());
+            pln!("built ix_{name} in {:.1}s", t.elapsed().as_secs_f64());
         }
         "snapshot" => {
             let out = o.rest.first().ok_or("snapshot needs an output path")?;
@@ -289,7 +368,25 @@ fn run(args: &[String]) -> Result<(), String> {
             let con = store::open(exists(&o.db)?).map_err(|e| e.to_string())?;
             con.execute("VACUUM INTO ?1", rusqlite::params![out])
                 .map_err(|e| e.to_string())?;
-            println!("{out}");
+            pln!("{out}");
+        }
+        "doctor" => {
+            let con = ro(&o.db)?;
+            // One record per session by default. Re-hashing 3 each over 10,470
+            // sessions took 37 s, which is too slow to run casually; 1 each is
+            // 13 s and still catches a rewritten file, because a rewrite moves
+            // every offset after the edit. `--limit 0` checks every record.
+            let n = if o.limit == 0 { 1 } else { o.limit };
+            let n = if o.rest.iter().any(|a| a == "all") {
+                0
+            } else {
+                n
+            };
+            let (ok, report) = query::doctor(&con, n, o.json);
+            pln!("{report}");
+            if !ok {
+                std::process::exit(1);
+            }
         }
         "stats" => {
             let con = ro(&o.db)?;
@@ -303,11 +400,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 )
                 .map_err(|e| e.to_string())?;
             let idx = std::fs::metadata(&o.db).map(|m| m.len()).unwrap_or(0);
-            println!("events    {ev}");
-            println!("sessions  {runs}");
-            println!("rejects   {rej}");
-            println!("indexed   {:.2} GB", bytes as f64 / 1e9);
-            println!(
+            pln!("events    {ev}");
+            pln!("sessions  {runs}");
+            pln!("rejects   {rej}");
+            pln!("indexed   {:.2} GB", bytes as f64 / 1e9);
+            pln!(
                 "index     {:.0} MB = {:.1}% of source",
                 idx as f64 / 1e6,
                 100.0 * idx as f64 / bytes.max(1) as f64
@@ -538,9 +635,9 @@ fn dump(con: &rusqlite::Connection, session: Option<&str>) -> Result<(), String>
     for (sid, seq) in rows {
         match store::read_record(con, sid, seq) {
             Ok(raw) => {
-                w.write_all(extract::strip_ws(&raw))
-                    .map_err(|e| e.to_string())?;
-                w.write_all(b"\n").map_err(|e| e.to_string())?;
+                if w.write_all(extract::strip_ws(&raw)).is_err() || w.write_all(b"\n").is_err() {
+                    return Ok(()); // reader closed the pipe
+                }
             }
             Err(e) => {
                 if skipped == 0 {
@@ -550,7 +647,9 @@ fn dump(con: &rusqlite::Connection, session: Option<&str>) -> Result<(), String>
             }
         }
     }
-    w.flush().map_err(|e| e.to_string())?;
+    if w.flush().is_err() {
+        return Ok(());
+    }
     if skipped > 0 {
         return Err(format!("{skipped} records unreadable; first: {first}"));
     }

@@ -159,6 +159,65 @@ mv "$WORK/st/up" "$WORK/st/s.jsonl"
 has "$("$BIN" --db "$WORK/st.db" search staletoken)" "changed on disk" "a stale snippet came back blank instead of named"
 "$BIN" --db "$WORK/st.db" dump s >/dev/null 2>&1 && fail "dump must not exit 0 when records are unreadable"
 
+echo "== search reports the total, not just that it truncated =="
+mkdir -p "$WORK/many"
+for i in 0 1 2 3 4; do
+  printf '{"uuid":"u%d","type":"assistant","timestamp":"2026-09-05T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"widget recurs here"}]}}\n' "$i"
+done > "$WORK/many/s.jsonl"
+"$BIN" --db "$WORK/many.db" sync "$WORK/many" >/dev/null
+out=$("$BIN" --db "$WORK/many.db" search widget -n 2)
+has "$out" "hits=2 of 5" "a truncated search must report the total, got: $(head -1 <<<"$out")"
+has "$("$BIN" --db "$WORK/many.db" search widget -n 9)" "hits=5 " \
+  "an untruncated search must not print a total"
+
+echo "== doctor sees what integrity_check cannot =="
+mkdir -p "$WORK/doc"
+for i in 0 1 2 3; do
+  printf '{"uuid":"u%d","type":"assistant","timestamp":"2026-09-05T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"alphaaaa"}]}}\n' "$i"
+done > "$WORK/doc/a.jsonl"
+cp "$WORK/doc/a.jsonl" "$WORK/doc/b.jsonl"
+"$BIN" --db "$WORK/doc.db" sync "$WORK/doc" >/dev/null
+"$BIN" --db "$WORK/doc.db" doctor >/dev/null || fail "a fresh index must pass doctor"
+
+# Same length, so only a content read can see it; plus a file that is gone.
+sed 's/alphaaaa/omegabbb/g' "$WORK/doc/a.jsonl" > "$WORK/doc/t" && mv "$WORK/doc/t" "$WORK/doc/a.jsonl"
+rm "$WORK/doc/b.jsonl"
+# SQLite still calls this index perfectly healthy, which is the whole point.
+has "$("$BIN" --db "$WORK/doc.db" sql 'PRAGMA integrity_check')" "ok" \
+  "integrity_check should still say ok -- that is why doctor exists"
+out=$("$BIN" --db "$WORK/doc.db" doctor 2>&1 || true)
+"$BIN" --db "$WORK/doc.db" doctor >/dev/null 2>&1 && fail "doctor must exit non-zero on a stale index"
+has "$out" "stale-record" "doctor missed a same-length rewrite"
+has "$out" "file-gone"    "doctor missed a deleted source file"
+j=$("$BIN" --json --db "$WORK/doc.db" doctor 2>&1 || true)
+has "$j" '"ok":false' "doctor --json must report ok:false"
+# sync repairs it, and doctor agrees.
+"$BIN" --db "$WORK/doc.db" sync "$WORK/doc" >/dev/null
+"$BIN" --db "$WORK/doc.db" doctor >/dev/null || fail "doctor must pass after sync heals the index"
+
+echo "== --json errors carry kind, hint and retryable =="
+j=$("$BIN" --json --db "$WORK/absent.db" stats 2>&1 >/dev/null || true)
+has "$j" '"kind":"no-index"'   "missing index must classify as no-index, got: $j"
+has "$j" '"retryable":false'   "no-index is not retryable"
+has "$j" '"hint":'             "every error carries a hint"
+j=$("$BIN" --json --db "$DB" nosuchcmd 2>&1 >/dev/null || true)
+has "$j" '"kind":"bad-usage"'  "unknown command must classify as bad-usage, got: $j"
+# The human path must stay human: one line, no JSON.
+h=$("$BIN" --db "$WORK/absent.db" stats 2>&1 >/dev/null || true)
+case "$h" in
+  '{'*) fail "the non-json path must not emit JSON, got: $h" ;;
+  "alog: "*) : ;;
+  *) fail "expected 'alog: ...' on stderr, got: $h" ;;
+esac
+
+echo "== a closed pipe is an exit, not a panic =="
+for cmd in "search fsync -n 50" "dump" "catalog" "errors"; do
+  err=$("$BIN" --db "$DB" $cmd 2>&1 >/dev/null | head -3)
+  case "$err" in
+    *panicked*|*"Broken pipe"*) fail "$cmd wrote '$err' when the reader closed" ;;
+  esac
+done
+
 echo "== no argument finds every framework directory under ~ =="
 FAKE="$WORK/home"
 mkdir -p "$FAKE/.claude/projects/p" "$FAKE/.codex/sessions/q"
