@@ -1,4 +1,5 @@
 mod extract;
+mod mcp;
 mod query;
 mod serve;
 mod store;
@@ -24,6 +25,7 @@ USAGE
   alog index <col>              build a secondary index: kind tool target ts err
   alog snapshot <out.db>        consistent copy (VACUUM INTO, never cp)
   alog doctor [all]             verify the index against the files
+  alog mcp                      MCP server over stdio, for an agent
   alog stats                    ingest and size numbers
 
 OPTIONS
@@ -309,27 +311,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "errors" => {
             let con = ro(&o.db)?;
             let n = if o.limit == 0 { 50 } else { o.limit };
-            pln!(
-                "{}",
-                query::query(
-                    &con,
-                    &format!(
-                        "SELECT r.ext AS session, e.seq,
-                                datetime(e.ts/1000, 'unixepoch', 'localtime') AS at,
-                                coalesce(e.tool, (SELECT p.tool FROM ev p
-                                    WHERE p.sid = e.sid AND p.seq < e.seq
-                                    AND p.tool IS NOT NULL
-                                    ORDER BY p.seq DESC LIMIT 1)) AS tool,
-                                coalesce(e.target, (SELECT p.target FROM ev p
-                                    WHERE p.sid = e.sid AND p.seq < e.seq
-                                    AND p.tool IS NOT NULL
-                                    ORDER BY p.seq DESC LIMIT 1)) AS target
-                         FROM ev e JOIN run r USING (sid) WHERE e.is_err = 1
-                         ORDER BY e.ts DESC LIMIT {n}"
-                    ),
-                    n
-                )
-            );
+            pln!("{}", query::query(&con, &errors_sql(n), n));
         }
         "dump" => {
             let con = ro(&o.db)?;
@@ -369,6 +351,9 @@ fn run(args: &[String]) -> Result<(), String> {
             con.execute("VACUUM INTO ?1", rusqlite::params![out])
                 .map_err(|e| e.to_string())?;
             pln!("{out}");
+        }
+        "mcp" => {
+            mcp::run(exists(&o.db)?)?;
         }
         "doctor" => {
             let con = ro(&o.db)?;
@@ -413,6 +398,25 @@ fn run(args: &[String]) -> Result<(), String> {
         other => return Err(format!("unknown command {other}\n\n{USAGE}")),
     }
     Ok(())
+}
+
+/// Failed tool calls, newest first. A failure record often carries no tool name
+/// of its own, so it inherits the one from the call it is answering.
+pub fn errors_sql(n: usize) -> String {
+    format!(
+        "SELECT r.ext AS session, e.seq,
+                datetime(e.ts/1000, 'unixepoch', 'localtime') AS at,
+                coalesce(e.tool, (SELECT p.tool FROM ev p
+                    WHERE p.sid = e.sid AND p.seq < e.seq
+                    AND p.tool IS NOT NULL
+                    ORDER BY p.seq DESC LIMIT 1)) AS tool,
+                coalesce(e.target, (SELECT p.target FROM ev p
+                    WHERE p.sid = e.sid AND p.seq < e.seq
+                    AND p.tool IS NOT NULL
+                    ORDER BY p.seq DESC LIMIT 1)) AS target
+         FROM ev e JOIN run r USING (sid) WHERE e.is_err = 1
+         ORDER BY e.ts DESC LIMIT {n}"
+    )
 }
 
 fn exists(db: &Path) -> Result<&Path, String> {

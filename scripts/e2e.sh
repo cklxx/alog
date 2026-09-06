@@ -170,6 +170,44 @@ has "$out" "hits=2 of 5" "a truncated search must report the total, got: $(head 
 has "$("$BIN" --db "$WORK/many.db" search widget -n 9)" "hits=5 " \
   "an untruncated search must not print a total"
 
+echo "== mcp speaks JSON-RPC over stdio =="
+mcp_out=$({
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"fsync","limit":1}}}'
+  echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sql","arguments":{"query":"DELETE FROM ev"}}}'
+  echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nosuchtool","arguments":{}}}'
+  echo '{"jsonrpc":"2.0","id":6,"method":"bogus/method"}'
+} | "$BIN" --db "$DB" mcp)
+# Six requests carry an id; the notification does not and must draw no reply.
+[ "$(grep -c . <<<"$mcp_out")" = "6" ] || fail "expected 6 responses, got $(grep -c . <<<"$mcp_out")"
+grep -q 'notifications/initialized' <<<"$mcp_out" && fail "a notification must not be answered"
+has "$mcp_out" '"protocolVersion"' "initialize must return a protocolVersion"
+has "$mcp_out" '"name":"search"'   "tools/list must advertise search"
+has "$mcp_out" '"name":"doctor"'   "tools/list must advertise doctor"
+# A refused write is a failed call, not a success carrying an error body.
+cat > "$WORK/mcpcheck.py" <<'PYEOF'
+import json, sys
+by = {}
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    d = json.loads(line)          # every line must be valid JSON
+    assert d["jsonrpc"] == "2.0", d
+    by[d["id"]] = d
+assert "tools" in by[2]["result"], "tools/list shape"
+assert by[3]["result"].get("isError") is None, "a good search is not an error"
+assert by[4]["result"].get("isError") is True, "a refused write must set isError"
+assert by[5]["result"].get("isError") is True, "an unknown tool must set isError"
+assert by[6]["error"]["code"] == -32601, "an unknown method is a protocol error"
+for t in by[2]["result"]["tools"]:
+    assert isinstance(t["inputSchema"], dict), t["name"]
+    assert len(t["description"]) > 40, t["name"]
+PYEOF
+python3 "$WORK/mcpcheck.py" <<<"$mcp_out" || fail "mcp responses are not well-formed"
+
 echo "== doctor sees what integrity_check cannot =="
 mkdir -p "$WORK/doc"
 for i in 0 1 2 3; do

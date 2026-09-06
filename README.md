@@ -132,6 +132,8 @@ alog errors                 failed tool calls, newest first
 alog dump [<session>]       byte-identical jsonl to stdout
 alog index <col>            secondary index: kind tool target ts err
 alog snapshot <out.db>      consistent copy (VACUUM INTO, never cp)
+alog doctor [all]           verify the index against the files
+alog mcp                    MCP server over stdio, for an agent
 alog stats                  ingest and size numbers
 ```
 
@@ -157,12 +159,31 @@ in an input object with no path-like target. With the fallbacks in place that co
 
 ## For agents
 
-The reader is usually a model with a limited context window:
+The reader is usually a model with a limited context window. Register the MCP
+server once and it has eight tools — `search`, `catalog`, `turns`, `timeline`,
+`errors`, `sql`, `record`, `doctor`:
+
+```console
+claude mcp add alog -- alog mcp
+codex mcp add alog -- alog mcp
+```
+
+Tools return the same TSV the CLI prints, deliberately: MCP content is text
+either way, and TSV costs 2.4× fewer tokens than JSON for the same rows because
+no key repeats. A refused write or a bad query comes back with `isError` set
+rather than as a success carrying an error body.
+
+Without MCP every command works from a shell, and `--json` turns a failure into
+`{"error":{"kind","message","hint","retryable"}}` so an agent branches on a
+stable `kind` instead of parsing prose.
+
+Either way:
 
 - `alog catalog` describes a 2.77M-record store in **1,669 bytes** — schema, time range,
   per-column null rate, and the full `kind`/`tool`/`model` distributions.
-- Results **never silently truncate**: the header reads
-  `rows=3 elapsed=9ms TRUNCATED at limit=3, more rows exist`.
+- Results **never silently truncate**, and say how much was left over: `search`
+  reads `hits=20 of 4184 elapsed=2ms -- narrow the query or raise --limit`, and
+  `sql` reads `rows=3 elapsed=9ms TRUNCATED at limit=3, more rows exist`.
 - Errors name the fix: `SELECT toolz FROM ev` returns
   `{"code":"ALOG_UNKNOWN_COLUMN","candidates":["tool"],"applicability":"MachineApplicable"}`.
 - A wrong literal too: `WHERE tool='Bashh'` returns
@@ -200,6 +221,27 @@ builds of the same files.
 When a record cannot be verified, the tool says so. A stale search hit prints
 `<...changed on disk; run \`alog sync\`>` in place of its snippet, and `dump` exits non-zero
 rather than writing a short file and reporting success.
+
+## Is the index still right
+
+`alog doctor` verifies the index against the files it was built from, and exits
+non-zero when it is not — so it works in CI:
+
+```console
+$ alog doctor
+sessions 10470  records 2769145  rejects 0
+verified 10470 records against their source files in 10364ms
+ok
+```
+
+It re-hashes a sample of records through the same function the writer used, stats
+every indexed path, and checks the full-text index for desync and orphans. One
+record per session by default (10.4 s over 10,470 sessions; three each took 37 s,
+too slow to run casually) — `alog doctor all` checks every record.
+
+`PRAGMA integrity_check` is not this check and cannot replace it. It returns `ok`
+on an index whose every row answers for text no longer on disk, because SQLite's
+pages are perfectly consistent — they just describe a file that changed.
 
 ## Durability
 
